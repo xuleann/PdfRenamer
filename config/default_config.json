@@ -1,0 +1,223 @@
+{
+  "config_version": 5,
+  "backend": "pymupdf",
+  "first_pages": 3,
+  "last_pages": 0,
+  "missing_value": "未知",
+  "require_preview": true,
+  "remember_mode": true,
+  "last_mode": "",
+  "last_dir": "",
+  "excel_strategy": "append",
+  "max_filename_len": 120,
+  "contract_type_gate": true,
+  "contract_gate_threshold": 2,
+  "last_input_mode": "folder",
+  "scan_ocr_enabled": true,
+  "scan_ocr_max_pages": 2,
+  "scan_ocr_include_last_page": true,
+  "scan_ocr_dpi": 200,
+  "scan_ocr_max_side": 2400,
+  "scan_ocr_timeout": 60,
+  "scan_ocr_lang": "auto",
+  "modes": {
+    "paper": {
+      "label": "论文",
+      "icon": "📄",
+      "description": "论文 / 期刊文献：题目、作者、期刊、发表年份",
+      "template": "{论文题目}_{作者}_{发表年份}",
+      "sheet": "论文汇总",
+      "fields": [
+        {
+          "name": "论文题目",
+          "keywords": [
+            "论文题目",
+            "文章题目",
+            "题名",
+            "题目",
+            "标题",
+            "Title",
+            "Article Title"
+          ],
+          "regex": "(?:论文题目|文章题目|题\\s*名|题\\s*目|标\\s*题|Title)[ \\t]*[:：][ \\t]*([^\\r\\n]{2,150})",
+          "enabled": true,
+          "required": true,
+          "type": "text",
+          "max_len": 80,
+          "source": "paper_title"
+        },
+        {
+          "name": "作者",
+          "keywords": [
+            "作者",
+            "著者",
+            "作者姓名",
+            "Authors",
+            "Author"
+          ],
+          "regex": "(?:作\\s*者|著\\s*者|Authors?|作者姓名)[ \\t]*[:：][ \\t]*([^\\r\\n]{1,150})",
+          "enabled": true,
+          "required": true,
+          "type": "list",
+          "max_len": 40,
+          "source": "paper_authors"
+        },
+        {
+          "name": "期刊",
+          "keywords": [
+            "期刊",
+            "刊名",
+            "发表于",
+            "来源期刊",
+            "会议名称",
+            "Journal",
+            "Source",
+            "Conference"
+          ],
+          "regex": "(?:期\\s*刊|刊\\s*名|发表于|来源期刊|会议名称|Journal|Source|Conference)[ \\t]*[:：][ \\t]*([^\\r\\n]{1,100})",
+          "enabled": true,
+          "required": false,
+          "type": "text",
+          "max_len": 50,
+          "source": "paper_venue"
+        },
+        {
+          "name": "发表年份",
+          "keywords": [
+            "发表年份",
+            "出版年份",
+            "年份",
+            "发表日期",
+            "出版日期",
+            "Year",
+            "Published"
+          ],
+          "regex": "(?:发表年份|出版年份|年\\s*份|发表日期|出版日期|Year|Published)\\D{0,12}((?:19|20)\\d{2})",
+          "enabled": true,
+          "required": true,
+          "type": "year",
+          "max_len": 4,
+          "source": "paper_year"
+        }
+      ]
+    },
+    "contract": {
+      "label": "合同",
+      "icon": "📃",
+      "description": "商务合同：名称、甲方、供方、时间、金额",
+      "template": "{合同名称}_{甲方}_{供方}_{时间}",
+      "sheet": "合同汇总",
+      "fields": [
+        {
+          "name": "合同名称",
+          "keywords": [
+            "合同名称",
+            "合同标题",
+            "协议名称",
+            "协议书名称",
+            "契约名称",
+            "合同全称"
+          ],
+          "regex": "(?:合同名称|合同标题|协议名称|协议书名称|契约名称|合同全称)[ \\t]*[:：][ \\t]*([^\\r\\n]{2,150})",
+          "enabled": true,
+          "required": true,
+          "type": "text",
+          "max_len": 80
+        },
+        {
+          "name": "甲方",
+          "keywords": [
+            "甲方（盖章）",
+            "甲方(盖章)",
+            "甲方",
+            "需方",
+            "买方",
+            "委托方",
+            "采购方",
+            "出租方",
+            "发包人",
+            "买受人",
+            "定作人",
+            "采购单位",
+            "建设单位",
+            "招标人",
+            "甲方单位",
+            "买受方",
+            "定作方",
+            "委托单位"
+          ],
+          "regex": "(?:甲\\s*方|需\\s*方|买\\s*方|委托方|采购方|出租方|发包人)\\s*(?:[（(][^）)\\r\\n]{0,20}[）)])?[ \\t]*[:：][ \\t]*([^\\r\\n]{2,100})",
+          "enabled": true,
+          "required": true,
+          "type": "company",
+          "max_len": 60
+        },
+        {
+          "name": "供方",
+          "keywords": [
+            "供方（盖章）",
+            "供方(盖章)",
+            "供方",
+            "乙方",
+            "供应商",
+            "卖方",
+            "承包人",
+            "供货方",
+            "承租方",
+            "出卖人",
+            "承揽人",
+            "中标单位",
+            "成交供应商",
+            "中标人",
+            "承接单位",
+            "服务方",
+            "受托方",
+            "乙方单位",
+            "供应方"
+          ],
+          "regex": "(?:供\\s*方|乙\\s*方|供应商|卖\\s*方|承包人|供货方|承租方|出卖人)\\s*(?:[（(][^）)\\r\\n]{0,20}[）)])?[ \\t]*[:：][ \\t]*([^\\r\\n]{2,100})",
+          "enabled": true,
+          "required": true,
+          "type": "company",
+          "max_len": 60
+        },
+        {
+          "name": "时间",
+          "keywords": [
+            "签订日期",
+            "签署日期",
+            "签约日期",
+            "签订时间",
+            "签署时间",
+            "合同日期",
+            "签约时间",
+            "订立日期",
+            "合同订立时间"
+          ],
+          "regex": "(?:签订日期|签署日期|签约日期|签订时间|签署时间|合同日期|签约时间|订立日期|合同订立时间)[ \\t]*[:：][ \\t]*([^\\r\\n]{2,60})",
+          "enabled": true,
+          "required": true,
+          "type": "date",
+          "max_len": 16
+        },
+        {
+          "name": "金额",
+          "keywords": [
+            "合同金额",
+            "合同总价",
+            "总金额",
+            "合同价款",
+            "价款",
+            "金额",
+            "合计"
+          ],
+          "regex": "(?:合同总金额|合同金额|合同总价|总金额|合同价款|价\\s*款|金\\s*额|合\\s*计)[^\\r\\n0-9]{0,24}?[¥￥]?[ \\t]*([0-9][0-9,]*(?:\\.[0-9]+)?[ \\t]*(?:万元|万|元人民币|元|人民币)?)",
+          "enabled": true,
+          "required": false,
+          "type": "money",
+          "max_len": 40
+        }
+      ]
+    }
+  }
+}

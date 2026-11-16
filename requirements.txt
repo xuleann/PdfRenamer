@@ -1,0 +1,18 @@
+# PdfRenamer 依赖清单（全部为本地确定性处理，无任何 AI / 推理 / 网络调用组件）
+# 运行时
+PyMuPDF==1.26.7          # PDF 文本层主引擎（AGPL 3.0，源码随本项目交付）
+openpyxl==3.1.5          # Excel 读写（MIT）
+pypdf==7.1.0             # 可选备用 PDF 后端（BSD）
+pdfplumber==0.11.10      # 可选备用 PDF 后端（MIT）
+
+# 仅打包期使用，不打进运行时逻辑
+pyinstaller==6.22.3
+
+# 仅文档生成期使用
+python-docx==1.2.0
+
+# 注意：
+# 1. 不要安装 PyMuPDF>=2.0，该版本会强制拉取 onnxruntime / numpy / pymupdf-layout 等推理库，
+#    违反「软件内部不嵌 AI」的要求，也会显著放大安装包体积。
+# 2. GUI 使用 Python 标准库 tkinter，无需安装任何 GUI 框架。
+# 3. 禁止引入 torch / transformers / onnxruntime / openai / requests / httpx 等。

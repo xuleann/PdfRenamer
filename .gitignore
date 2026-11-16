@@ -1,0 +1,25 @@
+# Python 环境与缓存（另一台电脑按 requirements.txt 重建）
+/.venv/
+**/__pycache__/
+*.py[cod]
+/.pytest_cache/
+
+# 构建、安装和运行产物
+/dist/
+/output/
+/wheels/
+/build/work/
+/build/innosetup/
+/build/innosetup-6.7.4.exe
+/_install_test*/
+
+# 真实样本与真实校准期望值：仅保留在本机，禁止上传
+/samples/user/
+/tests/samples/user_contract_pdfs/
+/tests/scanned_expect.json
+
+# 操作系统与编辑器
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
