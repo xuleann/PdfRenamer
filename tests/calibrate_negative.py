@@ -37,7 +37,8 @@ NEGATIVE_FILES = [
     "12_绩效评价报告B.pdf",
     "13_绩效评价工作方案.pdf",
 ]
-CONTRACT_FIELDS = ["合同名称", "甲方", "供方", "时间", "金额"]
+CONTRACT_FIELDS = ["合同类型", "乙方", "身份证号", "开始日期", "结束日期",
+                    "签订日期", "用工部门"]
 # None = 该字段必须为「缺失/未知」
 NEGATIVE_EXPECT: dict[str, dict[str, None]] = {
     name: {f: None for f in CONTRACT_FIELDS} for name in NEGATIVE_FILES
@@ -79,7 +80,8 @@ def main() -> int:
             "file": name, "doc_status": r.doc_status,
             "doc_ok": ok_doc, "missing": missing,
             "rename_status": rec.status, "no_rename": no_rename,
-            "contract_name": r.fields["合同名称"].value,
+            "contract_type": r.fields.get("合同类型", r.fields.get("", "")).value
+                             if "合同类型" in r.fields else "",
             "note": r.note,
         })
         print(f"\n■ {name}")

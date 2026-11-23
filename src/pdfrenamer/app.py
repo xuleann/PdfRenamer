@@ -77,17 +77,28 @@ def _selftest() -> int:
         cfg = load_config()
         log(f"config loaded: modes={list(cfg['modes'].keys())} backend={cfg['backend']}")
 
+        # 打包自检：确认本地 OCR（手写识别）在 exe 内真的可用——
+        # 模型文件若没被 PyInstaller 收集，这里会显示 engine_loaded=False。
+        try:
+            from .extractor import ocr_rapid
+            avail = ocr_rapid.rapid_available()
+            engine_ok = ocr_rapid._get_engine() is not None
+            log(f"ocr: rapid_available={avail} engine_loaded={engine_ok}")
+        except Exception as exc:  # pragma: no cover
+            log(f"ocr: 检查异常 {exc!r}")
+
         tmp = Path(tempfile.mkdtemp(prefix="pdfrenamer_selftest_"))
         try:
             doc = pymupdf.open()
             page = doc.new_page()
             for i, line in enumerate([
-                "设备采购合同",
-                "合同名称：自检用服务器采购合同",
-                "甲方（盖章）：华东某某科技有限公司",
-                "供方（盖章）：北京某某信息技术有限公司",
-                "签订日期：2024年3月5日",
-                "合同金额：¥1,200,000.00元",
+                "劳动合同",
+                "合同类型：劳动合同",
+                "乙方：张三",
+                "身份证号：110101199001011234",
+                "合同期限：2023年5月30日至2026年5月29日",
+                "签订日期：2023年5月30日",
+                "用工部门：办公室",
             ]):
                 page.insert_text((60, 72 + i * 26), line, fontname="china-s", fontsize=12)
             doc.save(tmp / "raw.pdf")
@@ -97,11 +108,14 @@ def _selftest() -> int:
             engine = ExtractEngine("contract", mc, cfg["backend"])
             results = engine.extract_many(list_pdfs(tmp))
             r = results[0]
-            log(f"extract: doc_status={r.doc_status} 甲方={r.fields['甲方'].value} 金额={r.fields['金额'].value}")
-            assert r.fields["甲方"].value == "华东某某科技有限公司", "甲方提取失败"
-            assert r.fields["金额"].value == "1200000.00元", "金额归一化失败"
+            log(f"extract: doc_status={r.doc_status} 合同类型={r.fields['合同类型'].value} "
+                f"乙方={r.fields['乙方'].value} 身份证号={r.fields['身份证号'].value}")
+            assert r.fields["合同类型"].value == "劳动合同", "合同类型提取失败"
+            assert r.fields["乙方"].value == "张三", "乙方提取失败"
+            assert r.fields["身份证号"].value == "110101199001011234", "身份证号提取失败"
 
-            renamer = RenameEngine(mc["template"], cfg["missing_value"], cfg["max_filename_len"])
+            renamer = RenameEngine(mc["template"], cfg["missing_value"], cfg["max_filename_len"],
+                                   sequence_start=cfg.get("sequence_counter", 1))
             records = renamer.plan(results, tmp)
             undo = UndoManager()
             rid = "selftest"

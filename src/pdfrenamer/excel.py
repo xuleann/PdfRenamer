@@ -208,7 +208,7 @@ class ExcelWriter:
         row["PDF 类型"] = self.mode_label
         return row
 
-    def append_row(self, row: dict) -> None:
+    def append_row(self, row: dict, field_images: dict[str, bytes] | None = None) -> None:
         if self.ws is None:
             raise RuntimeError("请先调用 prepare()")
         values = [row.get(h, "") for h in self.header]
@@ -223,16 +223,79 @@ class ExcelWriter:
                 cell.fill = _ALERT_FILL
             if h == "PDF 类型" and cell.value in TYPE_FILL:
                 cell.fill = TYPE_FILL[cell.value]
+        # V1.3.0：把手写字段局部截图嵌入对应字段单元格（低体积灰度小图）
+        if field_images:
+            self._embed_images(r, field_images)
         self.rows_written += 1
-        # 增量兜底：先写 jsonl，再存 Excel
+        # 增量兜底：先写 jsonl，再存 Excel（图片字节不写 jsonl，避免撑大日志）
         with _rows_path(self.directory).open("a", encoding="utf-8") as f:
             f.write(json.dumps({"mode": self.mode, "row": row}, ensure_ascii=False) + "\n")
         self._save()
+
+    # V1.3.6：截图显示尺寸上限（像素）。手写截图是横向长条，
+    # 必须同时约束宽和高，否则图片会横跨多列、盖住相邻单元格（用户实测反馈）。
+    _IMG_MAX_W = 235     # 约等于一个加宽后的字段列
+    _IMG_MAX_H = 90      # 允许的最大高度（条带兜底图可能偏高）
+
+    def _embed_images(self, row_idx: int, field_images: dict[str, bytes]) -> None:
+        """把 {字段名: JPEG字节} 嵌到该行对应字段列，等比缩放并约束在单元格内。
+
+        openpyxl 保存时会对同一图片多次重新打开，BytesIO 容易被关闭；改用系统临时
+        目录下的小文件作图片源（保存完成后在 finish() 清理），稳定且不占内存。
+        """
+        import tempfile
+        from openpyxl.drawing.image import Image as XLImage
+        col_of = {name: i + 1 for i, name in enumerate(self.header)}
+        if not hasattr(self, "_image_dir"):
+            self._image_dir = tempfile.mkdtemp(prefix="pdfrenamer_imgs_")
+            self._image_seq = 0
+        for name, data in field_images.items():
+            if name not in col_of or not data:
+                continue
+            try:
+                # V1.3.6：直接缩放图片像素本身（而非只设 XLImage.width）——
+                # openpyxl 保存时以图片实际像素为准，只设显示属性会被忽略，
+                # 导致原图 300~900px 宽直接盖住多列（用户实测反馈）。
+                from PIL import Image
+                from io import BytesIO
+                pil = Image.open(BytesIO(data))
+                ratio = min(self._IMG_MAX_W / float(pil.width or 1),
+                            self._IMG_MAX_H / float(pil.height or 1), 1.0)
+                new_w = max(1, int(pil.width * ratio))
+                new_h = max(1, int(pil.height * ratio))
+                pil = pil.resize((new_w, new_h), Image.LANCZOS)
+                self._image_seq += 1
+                img_path = Path(self._image_dir) / f"snip_{row_idx}_{self._image_seq}.jpg"
+                pil.save(str(img_path), format="JPEG", quality=72, optimize=True)
+                img = XLImage(str(img_path))
+                anchor = f"{get_column_letter(col_of[name])}{row_idx}"
+                img.anchor = anchor
+                self.ws.add_image(img)
+                # 列宽/行高调到能容纳图片：列宽字符数≈像素/7，行高磅≈像素*0.75
+                letter = get_column_letter(col_of[name])
+                need_w = new_w / 7.0 + 2
+                cur_w = self.ws.column_dimensions[letter].width
+                if cur_w is None or cur_w < need_w:
+                    self.ws.column_dimensions[letter].width = min(need_w, 36)
+                need_h = new_h * 0.75 + 4
+                cur_h = self.ws.row_dimensions[row_idx].height
+                if cur_h is None or cur_h < need_h:
+                    self.ws.row_dimensions[row_idx].height = min(need_h, 70)
+            except Exception:
+                continue
+
+    def _cleanup_images(self) -> None:
+        import shutil
+        d = getattr(self, "_image_dir", None)
+        if d:
+            shutil.rmtree(d, ignore_errors=True)
+            self._image_dir = None
 
     def finish(self) -> None:
         if self.ws is not None and self.ws.max_row >= 1:
             self.ws.auto_filter.ref = f"A1:{get_column_letter(len(self.header))}{self.ws.max_row}"
         self._save()
+        self._cleanup_images()  # 图片已写入 xlsx，删除系统临时目录
 
 
 def has_recoverable_rows(directory: str | Path) -> bool:

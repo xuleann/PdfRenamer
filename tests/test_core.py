@@ -70,11 +70,13 @@ class ExtractTests(unittest.TestCase):
         e = ExtractEngine("contract", MODES["contract"])
         r = e.extract_file(SAMPLES / "02_标准合同.pdf")
         self.assertEqual(r.doc_status, "ok")
-        self.assertEqual(r.fields["合同名称"].value, "2024年度服务器设备采购合同")
-        self.assertEqual(r.fields["甲方"].value, "华东某某科技有限公司")
-        self.assertEqual(r.fields["供方"].value, "北京某某信息技术有限公司")
-        self.assertEqual(r.fields["时间"].value, "2024-03-05")
-        self.assertEqual(r.fields["金额"].value, "1200000.00元")
+        self.assertEqual(r.fields["合同类型"].value, "劳动合同")
+        self.assertEqual(r.fields["乙方"].value, "张三")
+        self.assertEqual(r.fields["身份证号"].value, "110101199001011234")
+        self.assertEqual(r.fields["签订日期"].value, "2023-05-30")
+        self.assertEqual(r.fields["用工部门"].value, "办公室")
+        # 签订年份从签订日期派生
+        self.assertEqual(r.fields["签订年份"].value, "2023")
 
     def test_paper_fields(self):
         e = ExtractEngine("paper", MODES["paper"])
@@ -88,9 +90,9 @@ class ExtractTests(unittest.TestCase):
     def test_fullwidth_label_on_own_line(self):
         e = ExtractEngine("contract", MODES["contract"])
         r = e.extract_file(SAMPLES / "09_全角标签独占行.pdf")
-        self.assertEqual(r.fields["合同名称"].value, "智慧城市平台运维服务合同")
-        self.assertEqual(r.fields["甲方"].value, "华东某某科技有限公司")
-        self.assertEqual(r.fields["时间"].value, "2023-12-18")
+        self.assertEqual(r.fields["合同类型"].value, "劳动合同")
+        self.assertEqual(r.fields["乙方"].value, "赵六")
+        self.assertEqual(r.fields["签订日期"].value, "2023-12-18")
 
     def test_scanned_pdf(self):
         e = ExtractEngine("contract", MODES["contract"])
@@ -107,7 +109,7 @@ class ExtractTests(unittest.TestCase):
         e = ExtractEngine("contract", MODES["contract"])
         r = e.extract_file(SAMPLES / "05_字段缺失合同.pdf")
         self.assertEqual(r.doc_status, "partial")
-        self.assertIn("供方", r.missing_names())
+        self.assertIn("身份证号", r.missing_names())
 
 
 class PipelineTests(unittest.TestCase):

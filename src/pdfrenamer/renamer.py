@@ -7,23 +7,30 @@ import re
 from pathlib import Path
 from typing import Callable
 
-from .models import ExtractResult, RenameRecord, SKIP_DOC_STATUSES, ST_MISSING
+from .models import ExtractResult, RenameRecord, SKIP_DOC_STATUSES, ST_MISSING, FieldResult
 from .rules import sanitize_filename, unique_name
 
 PLACEHOLDER_RE = re.compile(r"\{([^{}]+)\}")
 
 
 class RenameEngine:
-    def __init__(self, template: str, missing_value: str = "未知", max_len: int = 120):
+    def __init__(self, template: str, missing_value: str = "未知", max_len: int = 120,
+                 sequence_start: int = 1):
         self.template = template or ""
         self.missing_value = missing_value
         self.max_len = max_len
+        # V1.2.0：全局序号计数器起始值（{序号} 占位符，zfill(2)，持续累加不重置）
+        self.sequence_start = max(1, int(sequence_start or 1))
+        self.sequence_used = 0   # 本次 plan 实际分配出去的序号个数
 
     def placeholders(self) -> list[str]:
         return PLACEHOLDER_RE.findall(self.template)
 
     def unknown_placeholders(self, field_names: list[str]) -> list[str]:
-        return [p for p in self.placeholders() if p not in field_names]
+        # {序号} 和 {签订年份} 是派生占位符，不视为「未知字段」
+        reserved = {"序号", "签订年份"}
+        return [p for p in self.placeholders()
+                if p not in field_names and p not in reserved]
 
     def _render(self, result: ExtractResult) -> tuple[str, list[str]]:
         used_missing: list[str] = []
@@ -41,9 +48,28 @@ class RenameEngine:
 
         return PLACEHOLDER_RE.sub(repl, self.template), used_missing
 
+    def _assign_sequences(self, results: list[ExtractResult]) -> None:
+        """为每个待处理结果注入 {序号} 字段（zfill(2)），跳过 skip 状态的不占号。"""
+        seq = self.sequence_start
+        for r in results:
+            if r.doc_status in SKIP_DOC_STATUSES:
+                # 跳过的文件不占用序号
+                continue
+            r.fields["序号"] = FieldResult(
+                "序号", str(seq).zfill(2), str(seq).zfill(2), "ok", "")
+            seq += 1
+        self.sequence_used = seq - self.sequence_start
+
+    @property
+    def next_sequence(self) -> int:
+        """本次 plan 结束后，下一个可用的序号（供调用方持久化）。"""
+        return self.sequence_start + self.sequence_used
+
     def plan(self, results: list[ExtractResult], directory: str | Path) -> list[RenameRecord]:
         """只生成计划，不碰任何文件。"""
         root = Path(directory)
+        # V1.2.0：先给结果分配 {序号} 占位符值
+        self._assign_sequences(results)
         src_paths = {str(Path(r.path).resolve()).lower() for r in results}
         used_lower: set[str] = set()
         try:

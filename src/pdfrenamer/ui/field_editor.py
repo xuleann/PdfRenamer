@@ -15,6 +15,7 @@ from . import theme
 TYPE_LABELS = [
     ("文本", "text"), ("作者/多人列表", "list"), ("年份", "year"),
     ("公司/机构", "company"), ("日期", "date"), ("金额", "money"),
+    ("身份证号", "idcard"), ("枚举", "enum"), ("姓名", "person_name"),
 ]
 LABEL_TO_TYPE = {label: value for label, value in TYPE_LABELS}
 TYPE_TO_LABEL = {value: label for label, value in TYPE_LABELS}
@@ -97,16 +98,24 @@ class FieldEditor(ttk.LabelFrame):
                   foreground=theme.SUBTLE, font=theme.FONT_SMALL).grid(
             row=4, column=1, columnspan=3, sticky="w")
 
-        ttk.Label(f, text="结构化来源").grid(row=5, column=0, sticky="w", padx=(0, 6), pady=(6, 2))
+        # V1.2.0：枚举字段的候选值（如用工部门 7 选 1），逗号分隔
+        self.v_choices = tk.StringVar()
+        ttk.Label(f, text="枚举选项").grid(row=5, column=0, sticky="w", padx=(0, 6), pady=2)
+        ttk.Entry(f, textvariable=self.v_choices).grid(row=5, column=1, columnspan=3, sticky="ew", pady=2)
+        ttk.Label(f, text="仅「枚举」类型生效，逗号分隔，如：办公室, 财务室, 交通",
+                  foreground=theme.SUBTLE, font=theme.FONT_SMALL).grid(
+            row=6, column=1, columnspan=3, sticky="w")
+
+        ttk.Label(f, text="结构化来源").grid(row=7, column=0, sticky="w", padx=(0, 6), pady=(6, 2))
         ttk.Combobox(f, textvariable=self.v_source,
                      values=[x[0] for x in SOURCE_LABELS], state="readonly",
-                     width=24).grid(row=5, column=1, sticky="w", pady=(6, 2))
+                     width=24).grid(row=7, column=1, sticky="w", pady=(6, 2))
         self.hint_src = ttk.Label(f, text="论文元数据/版式解析，优先于关键词与正则",
                                   foreground=theme.SUBTLE, font=theme.FONT_SMALL)
-        self.hint_src.grid(row=6, column=1, columnspan=3, sticky="w")
+        self.hint_src.grid(row=8, column=1, columnspan=3, sticky="w")
 
         opts = ttk.Frame(f)
-        opts.grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        opts.grid(row=9, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Checkbutton(opts, text="启用", variable=self.v_enabled).pack(side="left")
         ttk.Checkbutton(opts, text="必填", variable=self.v_required).pack(side="left", padx=(14, 0))
         ttk.Label(opts, text="文件名最大长度").pack(side="left", padx=(14, 4))
@@ -152,7 +161,7 @@ class FieldEditor(ttk.LabelFrame):
 
     def _clear_form(self):
         self._selected = None
-        for v in (self.v_name, self.v_keywords, self.v_regex):
+        for v in (self.v_name, self.v_keywords, self.v_regex, self.v_choices):
             v.set("")
         self.v_type.set("文本")
         self.v_source.set(SOURCE_LABELS[0][0])
@@ -171,6 +180,7 @@ class FieldEditor(ttk.LabelFrame):
         self.v_name.set(d.get("name", ""))
         self.v_keywords.set(", ".join(d.get("keywords", [])))
         self.v_regex.set(d.get("regex", ""))
+        self.v_choices.set(", ".join(d.get("choices", [])))
         self.v_source.set(SOURCE_TO_LABEL.get(d.get("source", ""), SOURCE_LABELS[0][0]))
         self.v_type.set(TYPE_TO_LABEL.get(d.get("type", "text"), "文本"))
         self.v_max.set(str(d.get("max_len", 0) or 0))
@@ -203,6 +213,7 @@ class FieldEditor(ttk.LabelFrame):
             "type": LABEL_TO_TYPE.get(self.v_type.get(), "text"),
             "max_len": max(0, mx),
             "source": LABEL_TO_SOURCE.get(self.v_source.get(), ""),
+            "choices": parse_keywords(self.v_choices.get()),
         }
 
     def _changed(self):

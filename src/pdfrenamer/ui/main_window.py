@@ -21,7 +21,7 @@ from ..engine import ExtractEngine, list_pdfs, check_same_parent, normalize_pdf_
 from ..excel import ExcelBusyError, ExcelWriter, recover_rows
 from ..extractor import available_backends
 from ..models import (DOC_OK, DOC_PARTIAL, FieldResult, SKIP_DOC_STATUSES,
-                      ST_MANUAL)
+                      ST_MANUAL, ST_MISSING, ST_HEURISTIC)
 from ..presets import MODES, MODE_CONTRACT, MODE_PAPER
 from ..renamer import RenameEngine
 from ..rules import clean_value, normalize_by_type, to_filename_value
@@ -95,6 +95,20 @@ class MainWindow:
         self._refresh_count()
         self._after_id = root.after(80, self._drain)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # V1.4.5：后台预热本地 OCR 模型（首次加载约 3 秒）。
+        # 放在窗口显示之后跑，用户选目录/看选项的时间就把模型加载完了，
+        # 第一次点「扫描」不用再等这 3 秒。
+        threading.Thread(target=self._warm_ocr, daemon=True).start()
+
+    @staticmethod
+    def _warm_ocr() -> None:
+        """预热 RapidOCR（失败静默，绝不打扰用户）。"""
+        try:
+            from ..extractor.ocr_rapid import _get_engine, rapid_available
+            if rapid_available():
+                _get_engine()
+        except Exception:
+            pass
 
     @staticmethod
     def _safe_geometry(root: tk.Tk, width: int, height: int) -> None:
@@ -510,6 +524,11 @@ class MainWindow:
             "scan_ocr_max_side": cfg.get("scan_ocr_max_side", 2400),
             "scan_ocr_timeout": cfg.get("scan_ocr_timeout", 60),
             "scan_ocr_lang": cfg.get("scan_ocr_lang", "auto"),
+            # V1.2.0：RapidOCR 手写识别开关 + 全局序号计数器
+            "scan_rapid_enabled": bool(cfg.get("scan_rapid_enabled", True)),
+            "sequence_counter": int(cfg.get("sequence_counter", 1) or 1),
+            # V1.3.0：手写字段截图嵌入 Excel 开关
+            "capture_field_images": bool(cfg.get("capture_field_images", True)),
         }
 
     # ------------------------------------------------------------------ 扫描
@@ -560,17 +579,21 @@ class MainWindow:
                 scan_ocr_max_side=snap["scan_ocr_max_side"],
                 scan_ocr_timeout=snap["scan_ocr_timeout"],
                 scan_ocr_lang=snap["scan_ocr_lang"],
+                scan_rapid_enabled=snap["scan_rapid_enabled"],
+                capture_field_images=snap.get("capture_field_images", True),
             )
             results = engine.extract_many(
                 files, progress=lambda i, t, n: self.q.put(("progress", i, t, f"提取 {n}")))
-            renamer = RenameEngine(snap["template"], snap["missing_value"], snap["max_len"])
+            renamer = RenameEngine(snap["template"], snap["missing_value"], snap["max_len"],
+                                   sequence_start=snap["sequence_counter"])
             names = [f["name"] for f in snap["mode_cfg"]["fields"] if f.get("enabled", True)]
             records = renamer.plan(results, directory)
-            self.q.put(("preview", results, records, renamer.unknown_placeholders(names), snap))
+            self.q.put(("preview", results, records, renamer.unknown_placeholders(names),
+                        snap, renamer.next_sequence))
         except Exception:
             self.q.put(("error", traceback.format_exc()))
 
-    def _fill_preview(self, results, records, warnings, snap):
+    def _fill_preview(self, results, records, warnings, snap, next_sequence=None):
         self.pv_tree.delete(*self.pv_tree.get_children())
         for i, (r, rec) in enumerate(zip(results, records)):
             new_name = rec.new_name if rec.status in ("planned", "done", "unchanged") else "（未改名）"
@@ -587,7 +610,7 @@ class MainWindow:
                 "、".join(r.missing_names()),
                 (r.skip_reason or rec.reason or r.note or "")[:120],
             ), tags=tuple(tags))
-        self.preview_data = (results, records, snap, warnings)
+        self.preview_data = (results, records, snap, warnings, next_sequence)
         self.btn_exec.config(state="normal")
         self._log(f"预览完成：{len(results)} 个文件，"
                   f"待改名 {sum(1 for x in records if x.status == 'planned')} 个，"
@@ -641,15 +664,28 @@ class MainWindow:
         entries: dict[str, tk.StringVar] = {}
         for i, f in enumerate(fields, 2):
             name = str(f.get("name", ""))
+            ftype = str(f.get("type", "text"))
+            choices = [str(c) for c in (f.get("choices") or [])]
             current = saved.get(name)
             if current is None:
                 fr = result.fields.get(name)
                 current = "" if (fr is None or fr.is_missing) else fr.value
             ttk.Label(box, text=name + "：").grid(row=i, column=0, sticky="w", pady=3)
             var = tk.StringVar(value=str(current))
-            ttk.Entry(box, textvariable=var, width=38).grid(
-                row=i, column=1, sticky="ew", pady=3, padx=(6, 0))
+            if ftype == "enum" and choices:
+                # V1.2.0：枚举字段（用工部门/合同类型）用下拉点选，不手敲
+                cb = ttk.Combobox(box, textvariable=var, values=choices, state="readonly",
+                                  width=35)
+                cb.grid(row=i, column=1, sticky="ew", pady=3, padx=(6, 0))
+            else:
+                ttk.Entry(box, textvariable=var, width=38).grid(
+                    row=i, column=1, sticky="ew", pady=3, padx=(6, 0))
             entries[name] = var
+            # V1.2.0：日期字段加格式提示
+            if ftype == "date":
+                ttk.Label(box, text="格式 YYYY-MM-DD",
+                          style="Muted.TLabel", font=theme.FONT_SMALL).grid(
+                    row=i, column=2, sticky="w", padx=(6, 0))
         box.columnconfigure(1, weight=1)
 
         def apply():
@@ -673,7 +709,7 @@ class MainWindow:
         """把人工补录值写回结果并重新生成改名计划（原地、不移动文件）。"""
         if not self.preview_data:
             return
-        results, _records, snap, warnings = self.preview_data
+        results, _records, snap, warnings, _next = self.preview_data
         if not self.manual_overrides:
             return
         patched: list = []
@@ -688,7 +724,8 @@ class MainWindow:
                           if str(x.get("name")) == name), None)
                 ftype = str((f or {}).get("type", "text"))
                 max_len = int((f or {}).get("max_len", 0) or 0)
-                display = normalize_by_type(raw, ftype) or clean_value(raw)
+                choices = [str(c) for c in ((f or {}).get("choices") or [])]
+                display = normalize_by_type(raw, ftype, choices) or clean_value(raw)
                 rr.fields[name] = FieldResult(
                     name, display,
                     to_filename_value(display, ftype, max_len) or snap["missing_value"],
@@ -697,20 +734,21 @@ class MainWindow:
             if rr.doc_status in SKIP_DOC_STATUSES:
                 rr.doc_status = DOC_PARTIAL if rr.missing_names() else DOC_OK
             patched.append(rr)
-        renamer = RenameEngine(snap["template"], snap["missing_value"], snap["max_len"])
+        renamer = RenameEngine(snap["template"], snap["missing_value"], snap["max_len"],
+                               sequence_start=snap.get("sequence_counter", 1))
         records = renamer.plan(patched, snap.get("output_dir") or self.dir_var.get().strip())
         for rec in records:
             if rec.status == "planned" and self._result_key(rec.src) in self.manual_overrides:
                 rec.reason = (rec.reason + "；" if rec.reason else "") + "人工补录"
-        self.preview_data = (patched, records, snap, warnings)
-        self._fill_preview(patched, records, warnings, snap)
+        self.preview_data = (patched, records, snap, warnings, renamer.next_sequence)
+        self._fill_preview(patched, records, warnings, snap, renamer.next_sequence)
 
     # ------------------------------------------------------------------ 执行
     def _on_execute(self):
         if self.busy or not self.preview_data:
             return
         self._apply_overrides()          # 执行前再应用一次，确保补录值生效
-        results, records, snap, _ = self.preview_data
+        results, records, snap, _, next_seq = self.preview_data
         d = snap.get("output_dir") or self.dir_var.get().strip()
         n = sum(1 for x in records if x.status == "planned")
         if not messagebox.askyesno(
@@ -721,6 +759,14 @@ class MainWindow:
             return
         self._set_busy(True)
         self._log("开始执行：写入还原日志 → 重命名 → 导出 Excel…")
+        # V1.2.0：序号全局单调递增——确认执行后立即占用本次分配的序号并落盘，
+        # 即使后续执行失败/撤销，序号也不回退。
+        if next_seq is not None:
+            self.cfg["sequence_counter"] = int(next_seq)
+            try:
+                save_config(self.cfg)
+            except Exception:
+                pass
         rid = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         threading.Thread(target=self._execute_worker, args=(d, results, records, snap, rid),
                          daemon=True).start()
@@ -729,6 +775,39 @@ class MainWindow:
         try:
             undo = UndoManager()
             undo.save_plan(directory, snap["mode"], records, rid)   # 改名前先落盘
+
+            # V1.3.7：只对「识别不可信」的字段截图——正则可靠命中的(ST_OK)显示文字即可，
+            # 缺失/启发式猜测/关键词兜底的才截图供人工核对。表格更干净、文件更小。
+            # 截图在改名前现算（改名后原路径失效），放在执行阶段不拖慢扫描预览。
+            field_images_by_path: dict[str, dict] = {}
+            if snap.get("capture_field_images", True) and snap["mode"] == "contract":
+                try:
+                    from ..extractor.field_crop import FIELD_ANCHORS, crop_field_images
+                    eligible = [f["name"] for f in snap["mode_cfg"]["fields"]
+                                if f.get("enabled", True) and f.get("name") in FIELD_ANCHORS]
+                    from ..rules import suspect_field_value
+                    for r in results:
+                        if r.doc_status in SKIP_DOC_STATUSES:
+                            continue
+                        # 截「不可信」字段：状态非OK，或值明显可疑（错值也算没识别准）。
+                        # 认准的字段不贴图——表格保持干净；只有缺失/串字/可疑的才把原图摆出来。
+                        targets = []
+                        for nm in eligible:
+                            fr = r.fields.get(nm)
+                            unreliable = (fr is None or fr.is_missing
+                                          or fr.status in (ST_MISSING, ST_HEURISTIC)
+                                          or fr.status not in ("ok", ST_MANUAL))
+                            if not unreliable and suspect_field_value(nm, fr.value):
+                                unreliable = True   # 状态OK但值可疑（如乙方=单位名/串字）
+                            if unreliable:
+                                targets.append(nm)
+                        if targets:
+                            imgs = crop_field_images(r.path, targets)
+                            if imgs:
+                                field_images_by_path[str(r.path)] = imgs
+                except Exception:
+                    pass
+
             renamer = RenameEngine(snap["template"], snap["missing_value"], snap["max_len"])
             renamer.execute(
                 records, progress=lambda i, t, n: self.q.put(("progress", i, t, f"改名 {n}")))
@@ -740,7 +819,8 @@ class MainWindow:
                                  snap["missing_value"], snap["strategy"])
             writer.prepare()
             for i, (r, rec) in enumerate(zip(results, records), 1):
-                writer.append_row(writer.build_row(r, rec))
+                writer.append_row(writer.build_row(r, rec),
+                                  field_images_by_path.get(str(r.path)))
                 self.q.put(("progress", i, len(results), f"写入 Excel {r.original_name}"))
             writer.finish()
 
@@ -798,7 +878,7 @@ class MainWindow:
                     if i == total or i % 5 == 0:
                         self._log(f"  {i}/{total} {text}")
                 elif kind == "preview":
-                    self._fill_preview(msg[1], msg[2], msg[3], msg[4])
+                    self._fill_preview(msg[1], msg[2], msg[3], msg[4], msg[5] if len(msg) > 5 else None)
                     self._set_busy(False)
                     self.status_var.set("预览完成，请核对后点「② 确认执行」")
                 elif kind == "done":

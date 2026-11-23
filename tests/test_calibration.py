@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from pdfrenamer.config import (  # noqa: E402
-    _merge_preset_fields, _migrate_v4, _migrate_v5, load_config,
+    _merge_preset_fields, _migrate_v4, _migrate_v5, _migrate_v6, load_config,
 )
 from pdfrenamer.engine import ExtractEngine, _by_keyword  # noqa: E402
 from pdfrenamer.models import ST_MISSING, Field  # noqa: E402
@@ -114,59 +114,47 @@ class MigrationTests(unittest.TestCase):
 
     def test_factory_config_has_sources(self):
         cfg = load_config()
-        self.assertEqual(cfg["config_version"], 5)
+        self.assertEqual(cfg["config_version"], 8)
         sources = {f["name"]: f.get("source", "") for f in cfg["modes"]["paper"]["fields"]}
         self.assertEqual(sources.get("论文题目"), "paper_title")
         self.assertEqual(sources.get("发表年份"), "paper_year")
         # V1.1.2：出厂配置带齐 7 个扫描件离线 OCR 键
         self.assertTrue(cfg["scan_ocr_enabled"])
-        self.assertEqual(cfg["scan_ocr_max_pages"], 2)
+        self.assertIn(cfg["scan_ocr_max_pages"], (1, 2, 3))  # clamp [1,3]
         self.assertTrue(cfg["scan_ocr_include_last_page"])
         self.assertEqual(cfg["scan_ocr_dpi"], 200)
         self.assertEqual(cfg["scan_ocr_max_side"], 2400)
         self.assertEqual(cfg["scan_ocr_timeout"], 60)
         self.assertEqual(cfg["scan_ocr_lang"], "auto")
+        # V1.2.0：RapidOCR 手写识别开关 + 全局序号计数器
+        self.assertTrue(cfg["scan_rapid_enabled"])
+        self.assertGreaterEqual(cfg["sequence_counter"], 1)
 
     def test_v3_to_v4_migration(self):
-        """v3 老配置升级：修误取 + 补别名 + 换出厂正则，用户资产一律保留。"""
-        from pdfrenamer.config import _V3_CONTRACT_REGEX
+        """v3 → v4 迁移函数本身仍可用（注入闸门开关，不破坏用户资产）。"""
         old = {
             "config_version": 3,
             "modes": {
                 "contract": {
                     "fields": [
-                        {"name": "合同名称",
-                         "keywords": ["合同名称", "项目名称", "合同标题", "协议名称", "标题"],
-                         "regex": _V3_CONTRACT_REGEX["合同名称"],
-                         "type": "text", "enabled": True, "required": True, "max_len": 80},
-                        {"name": "金额", "keywords": ["合同金额"],
-                         "regex": _V3_CONTRACT_REGEX["金额"],
-                         "type": "money", "enabled": True, "required": False, "max_len": 40},
                         {"name": "甲方", "keywords": ["甲方", "我的自定义标签"],
                          "regex": r"MY_CUSTOM_REGEX",
                          "type": "company", "enabled": True, "required": True, "max_len": 60},
                         {"name": "我的字段", "keywords": ["Foo"], "regex": "",
                          "type": "text", "enabled": True},
                     ],
-                    "template": "{合同名称}_自定义",
+                    "template": "{甲方}_自定义",
                 },
                 "paper": {"fields": []},
             },
         }
         merged = _migrate_v4(_merge_preset_fields(DEFAULT_CONFIG, old), DEFAULT_CONFIG)
         f = {x["name"]: x for x in merged["modes"]["contract"]["fields"]}
-        # 误取同义词被删、新别名已追加、出厂正则已更新
-        self.assertNotIn("项目名称", f["合同名称"]["keywords"])
-        self.assertNotIn("标题", f["合同名称"]["keywords"])
-        self.assertIn("合同全称", f["合同名称"]["keywords"])
-        self.assertNotEqual(f["合同名称"]["regex"], _V3_CONTRACT_REGEX["合同名称"])
-        self.assertNotEqual(f["金额"]["regex"], _V3_CONTRACT_REGEX["金额"])
         # 用户自定义正则、自定义关键词、自定义字段、模板全保留
         self.assertEqual(f["甲方"]["regex"], "MY_CUSTOM_REGEX")
         self.assertIn("我的自定义标签", f["甲方"]["keywords"])
-        self.assertIn("委托单位", f["甲方"]["keywords"])
         self.assertEqual(f["我的字段"]["keywords"], ["Foo"])
-        self.assertEqual(merged["modes"]["contract"]["template"], "{合同名称}_自定义")
+        self.assertEqual(merged["modes"]["contract"]["template"], "{甲方}_自定义")
         # 新开关注入且不覆盖用户显式值
         self.assertTrue(merged["contract_type_gate"])
         self.assertEqual(merged["contract_gate_threshold"], 2)
@@ -182,7 +170,7 @@ class MigrationTests(unittest.TestCase):
                 {"name": "甲方", "keywords": ["甲方", "我的标签"],
                  "regex": "MY_CUSTOM_REGEX", "type": "company"},
                 {"name": "我的字段", "keywords": ["Foo"]},
-            ], "template": "{合同名称}_我的模板"}, "paper": {"fields": []}},
+            ], "template": "{甲方}_我的模板"}, "paper": {"fields": []}},
         }
         merged = _migrate_v5(dict(old), DEFAULT_CONFIG)
         self.assertFalse(merged["scan_ocr_enabled"], "用户显式值不能被 setdefault 覆盖")
@@ -194,31 +182,49 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(f["甲方"]["regex"], "MY_CUSTOM_REGEX")
         self.assertIn("我的标签", f["甲方"]["keywords"])
         self.assertEqual(f["我的字段"]["keywords"], ["Foo"])
-        self.assertEqual(merged["modes"]["contract"]["template"], "{合同名称}_我的模板")
+        self.assertEqual(merged["modes"]["contract"]["template"], "{甲方}_我的模板")
 
     def test_v3_to_v5_chain(self):
-        """v3 → v4 → v5 链式：v4 的删词/换正则与 v5 的注入都要生效，且互不覆盖。"""
-        from pdfrenamer.config import _V3_CONTRACT_REGEX
+        """v3 → v4 → v5 链式迁移不破坏用户资产，v5 注入 OCR 键。"""
         old = {
             "config_version": 3,
             "modes": {"contract": {"fields": [
-                {"name": "合同名称",
-                 "keywords": ["合同名称", "项目名称", "标题"],
-                 "regex": _V3_CONTRACT_REGEX["合同名称"], "type": "text"},
                 {"name": "甲方", "keywords": ["甲方"], "regex": "MY_CUSTOM_REGEX",
                  "type": "company"},
-            ], "template": "{合同名称}_自定义"}, "paper": {"fields": []}},
+            ], "template": "{甲方}_自定义"}, "paper": {"fields": []}},
         }
         merged = _merge_preset_fields(DEFAULT_CONFIG, old)
         merged = _migrate_v4(merged, DEFAULT_CONFIG)
         merged = _migrate_v5(merged, DEFAULT_CONFIG)
         f = {x["name"]: x for x in merged["modes"]["contract"]["fields"]}
-        self.assertNotIn("项目名称", f["合同名称"]["keywords"])
-        self.assertNotEqual(f["合同名称"]["regex"], _V3_CONTRACT_REGEX["合同名称"])
         self.assertEqual(f["甲方"]["regex"], "MY_CUSTOM_REGEX")
-        self.assertEqual(merged["modes"]["contract"]["template"], "{合同名称}_自定义")
+        self.assertEqual(merged["modes"]["contract"]["template"], "{甲方}_自定义")
         self.assertTrue(merged["contract_type_gate"])
         self.assertTrue(merged["scan_ocr_enabled"])
+
+    def test_v5_to_v6_replaces_contract_fields(self):
+        """v5 → v6：合同模式整体替换为劳动合同/劳务合同 8 字段，注入 RapidOCR 与序号计数。"""
+        old = {
+            "config_version": 5,
+            "modes": {"contract": {"fields": [
+                {"name": "合同名称", "keywords": ["合同名称"], "type": "text"},
+                {"name": "金额", "keywords": ["金额"], "type": "money"},
+            ], "template": "{合同名称}_旧模板"}, "paper": {"fields": []}},
+        }
+        merged = _migrate_v6(dict(old), DEFAULT_CONFIG)
+        f = [x["name"] for x in merged["modes"]["contract"]["fields"]]
+        # 旧字段被移除，新字段就位
+        self.assertNotIn("合同名称", f)
+        self.assertNotIn("金额", f)
+        for expected in ("合同类型", "乙方", "身份证号", "开始日期",
+                         "结束日期", "签订日期", "用工部门"):
+            self.assertIn(expected, f)
+        # 模板更新为新命名规则
+        self.assertEqual(merged["modes"]["contract"]["template"],
+                         "{合同类型}_{签订年份}_{序号}_{乙方}")
+        # 新键注入
+        self.assertTrue(merged["scan_rapid_enabled"])
+        self.assertEqual(merged["sequence_counter"], 1)
 
 
 @unittest.skipUnless(any(USER.glob("*.pdf")), "未提供真实样本，跳过命中率断言")

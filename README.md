@@ -54,8 +54,9 @@ PdfRenamer/（项目根目录，可克隆到任意路径）
 ├─ config/default_config.json      出厂预设（打包进 exe）
 ├─ assets/app.ico                  图标
 ├─ build/                          spec、bat、Inno Setup .iss、图标/文档生成脚本
-├─ tests/                          样例 PDF、单元测试、UI 冒烟、合规扫描、校准脚本
-├─ samples/user/                   真实样本（6 篇论文 PDF + 4 份真实合同扫描件）
+├─ tests/                          单元测试、UI 冒烟、合规扫描、校准脚本
+│  └─ samples/                     合同/论文样本 PDF **不入库**，需运行 tests/make_samples.py 本地生成
+├─ samples/user/                   真实样本（仅本机，已在 .gitignore 中排除）
 ├─ output/html/                    两份 Word 的排版 HTML 中间产物
 ├─ wheels/                         离线 wheel 兜底
 └─ requirements.txt / README.md

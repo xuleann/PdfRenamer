@@ -28,7 +28,8 @@ DOC_NOT_CONTRACT = "not_contract"
 SKIP_DOC_STATUSES = {DOC_NO_TEXT, DOC_GARBLED, DOC_ENCRYPTED, DOC_ERROR,
                      DOC_NOT_CONTRACT}
 
-FIELD_TYPES = ("text", "list", "year", "company", "date", "money")
+FIELD_TYPES = ("text", "list", "year", "company", "date", "money",
+               "idcard", "enum", "person_name")
 
 
 @dataclass
@@ -42,6 +43,7 @@ class Field:
     type: str = "text"
     max_len: int = 0          # 用于文件名的最大字符数，0 表示不限制
     source: str = ""          # 可选的结构化来源，如 paper_title / paper_year
+    choices: list[str] = field(default_factory=list)  # V1.2.0：enum 字段的候选枚举项
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -53,6 +55,7 @@ class Field:
             "type": self.type,
             "max_len": int(self.max_len),
             "source": self.source,
+            "choices": list(self.choices),
         }
 
     @staticmethod
@@ -69,6 +72,7 @@ class Field:
             type=t,
             max_len=int(d.get("max_len", 0) or 0),
             source=str(d.get("source", "") or ""),
+            choices=[str(c) for c in d.get("choices", []) if str(c).strip()],
         )
 
 
@@ -96,6 +100,8 @@ class ExtractResult:
     doc_status: str = DOC_OK
     text_chars: int = 0
     note: str = ""
+    # V1.3.0：手写敏感字段的局部截图（字段名 -> 压缩 PNG 字节），嵌入 Excel 供人工核对
+    field_images: dict[str, bytes] = field(default_factory=dict)
 
     @property
     def skip_reason(self) -> str:

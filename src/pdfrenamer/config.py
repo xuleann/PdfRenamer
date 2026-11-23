@@ -19,7 +19,7 @@ from typing import Any
 from .presets import DEFAULT_CONFIG, MODES
 
 APP_DIR_NAME = "PdfRenamer"
-CONFIG_VERSION = 5
+CONFIG_VERSION = 8
 
 
 def appdata_dir() -> Path:
@@ -123,7 +123,47 @@ def _validate(cfg: dict) -> dict:
     cfg["scan_ocr_max_side"] = max(800, min(2600, int(cfg.get("scan_ocr_max_side", 2400) or 2400)))
     cfg["scan_ocr_timeout"] = max(10, min(180, int(cfg.get("scan_ocr_timeout", 60) or 60)))
     cfg["scan_ocr_lang"] = str(cfg.get("scan_ocr_lang") or "auto")
+    # V1.2.0：RapidOCR 手写识别开关 + 全局序号计数器
+    cfg["scan_rapid_enabled"] = bool(cfg.get("scan_rapid_enabled", True))
+    cfg["sequence_counter"] = max(1, int(cfg.get("sequence_counter", 1) or 1))
+    # V1.3.0：手写字段截图嵌入 Excel 开关（默认开，不覆盖用户显式关闭值）
+    if "capture_field_images" not in cfg:
+        cfg["capture_field_images"] = True
+    else:
+        cfg["capture_field_images"] = bool(cfg["capture_field_images"])
+    _align_contract_field_types(cfg)
     return cfg
+
+
+# V1.2.1：合同模式内置字段的权威类型。用户历史配置里「乙方」常被存成 text，
+# 导致 person_name 的防误取逻辑不生效；每次加载按字段名无条件对齐类型，
+# 确保识别规则与字段声明一致。不覆盖用户自定义的正则/关键词/choices。
+_CONTRACT_FIELD_TYPES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "合同类型": ("enum", ("劳动合同", "劳务合同")),
+    "乙方": ("person_name", ()),
+    "身份证号": ("idcard", ()),
+    "开始日期": ("date", ()),
+    "结束日期": ("date", ()),
+    "签订日期": ("date", ()),
+    "用工部门": ("enum", ("办公室", "财务室", "交通", "物业", "服务一部", "服务二部", "资产")),
+}
+
+
+def _align_contract_field_types(cfg: dict) -> None:
+    lm = (cfg.get("modes") or {}).get("contract")
+    if not isinstance(lm, dict) or not isinstance(lm.get("fields"), list):
+        return
+    for f in lm["fields"]:
+        if not isinstance(f, dict):
+            continue
+        spec = _CONTRACT_FIELD_TYPES.get(str(f.get("name", "")))
+        if not spec:
+            continue
+        ftype, choices = spec
+        if f.get("type") != ftype:
+            f["type"] = ftype
+        if choices and not f.get("choices"):
+            f["choices"] = list(choices)
 
 
 def _merge_preset_fields(defaults: dict, loaded: dict) -> dict:
@@ -217,6 +257,28 @@ def _migrate_v5(loaded: dict, defaults: dict) -> dict:
     return loaded
 
 
+def _migrate_v6(loaded: dict, defaults: dict) -> dict:
+    """v5 → v6：合同模式重构为「劳动合同/劳务合同」8 字段，注入手写 OCR 与序号计数。
+
+    这是 V1.2.0 的一次**明确的产品转向**：合同模式从「通用商务合同」改为
+    「劳动合同/劳务合同」专用，字段整体替换为新预设（合同类型/乙方/身份证号/
+    开始日期/结束日期/签订日期/用工部门），并更新默认命名模板。
+    """
+    # 1) 注入 RapidOCR 开关与序号计数器（不覆盖用户显式值）
+    loaded.setdefault("scan_rapid_enabled", True)
+    loaded.setdefault("sequence_counter", 1)
+    # 2) 合同模式字段 + 模板整体替换为新预设
+    dm = (defaults.get("modes") or {}).get("contract")
+    lmodes = loaded.get("modes")
+    if isinstance(dm, dict) and isinstance(lmodes, dict):
+        lm = lmodes.get("contract")
+        if isinstance(lm, dict):
+            lm["fields"] = deepcopy(dm.get("fields", []))
+            lm["template"] = dm.get("template", lm.get("template", ""))
+            lm["description"] = dm.get("description", lm.get("description", ""))
+    return loaded
+
+
 def load_config() -> dict:
     defaults = _factory_defaults()
     p = config_path()
@@ -235,6 +297,11 @@ def load_config() -> dict:
                 loaded = _migrate_v4(loaded, defaults)
             if old_v < 5:
                 loaded = _migrate_v5(loaded, defaults)
+            # v6（合同字段整体替换 + RapidOCR/序号注入）对任何 < 8 的旧配置都要执行：
+            # 历史遗留的 config.json 可能被写过更高版本号（如 7），但其合同字段仍是旧的，
+            # 必须无条件走一次 v6 迁移，确保劳动合同 8 字段就位。
+            if old_v < 8:
+                loaded = _migrate_v6(loaded, defaults)
     except (OSError, ValueError, TypeError):
         bad = appdata_dir() / f"config_broken_{datetime.now():%Y%m%d%H%M%S}.json"
         try:
@@ -255,7 +322,9 @@ def save_config(cfg: dict) -> None:
 def export_defaults(target: Path) -> None:
     """把出厂默认导出成 config/default_config.json（打包时随 exe 携带）。"""
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
+    data = deepcopy(DEFAULT_CONFIG)
+    data["config_version"] = CONFIG_VERSION  # 与代码版本号保持一致
+    target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def get_mode_config(cfg: dict, mode: str) -> dict:

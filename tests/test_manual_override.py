@@ -88,8 +88,8 @@ class ManualOverrideTests(unittest.TestCase):
         renamer = RenameEngine(MODES["contract"]["template"], "未知", 120)
         records = renamer.plan(results, self.tmp)
         snap = self.win._snapshot(str(self.tmp))
-        self.win.preview_data = (results, records, snap, [])
-        self.win._fill_preview(results, records, [], snap)
+        self.win.preview_data = (results, records, snap, [], renamer.next_sequence)
+        self.win._fill_preview(results, records, [], snap, renamer.next_sequence)
         return results, records
 
     def test_override_turns_skipped_into_planned(self):
@@ -97,36 +97,37 @@ class ManualOverrideTests(unittest.TestCase):
         self.assertEqual(records[0].status, "skipped")
         key = self.win._result_key(results[0].path)
         self.win.manual_overrides[key] = {
-            "合同名称": "扫描件采购合同",
-            "甲方": "华东某某科技有限公司",
-            "供方": "北京某某信息技术有限公司",
-            "时间": "2024-03-05",
+            "合同类型": "劳动合同",
+            "乙方": "张三",
+            "身份证号": "110101199001011234",
+            "签订日期": "2024-03-05",
         }
         self.win._apply_overrides()
-        patched, new_records, _, _ = self.win.preview_data
+        patched, new_records, _, _, _ = self.win.preview_data
         self.assertEqual(patched[0].doc_status, "partial")
-        self.assertEqual(patched[0].fields["甲方"].status, ST_MANUAL)
-        self.assertEqual(patched[0].fields["甲方"].note, "人工补录")
+        self.assertEqual(patched[0].fields["乙方"].status, ST_MANUAL)
+        self.assertEqual(patched[0].fields["乙方"].note, "人工补录")
         self.assertEqual(new_records[0].status, "planned")
-        self.assertTrue(new_records[0].new_name.startswith("扫描件采购合同_"))
-        self.assertIn("华东某某科技有限公司", new_records[0].new_name)
+        self.assertTrue(new_records[0].new_name.startswith("劳动合同_"))
+        self.assertIn("张三", new_records[0].new_name)
         self.assertIn("人工补录", new_records[0].reason)
 
     def test_override_values_normalized_by_type(self):
         results, _ = self._fake_preview()
         key = self.win._result_key(results[0].path)
         self.win.manual_overrides[key] = {
-            "合同名称": "测试合同", "甲方": "甲公司", "供方": "乙公司",
-            "时间": "2024年3月5日", "金额": "¥1,200,000.00元",
+            "合同类型": "劳动合同", "乙方": "张三", "身份证号": "110101199001011234",
+            "签订日期": "2024年3月5日", "用工部门": "财务室",
         }
         self.win._apply_overrides()
         f = self.win.preview_data[0][0].fields
-        self.assertEqual(f["时间"].value, "2024-03-05")
-        self.assertEqual(f["金额"].value, "1200000.00元")
+        self.assertEqual(f["签订日期"].value, "2024-03-05")
+        self.assertEqual(f["身份证号"].value, "110101199001011234")
+        self.assertEqual(f["用工部门"].value, "财务室")
 
     def test_clear_preview_drops_overrides(self):
         results, _ = self._fake_preview()
-        self.win.manual_overrides[self.win._result_key(results[0].path)] = {"甲方": "甲公司"}
+        self.win.manual_overrides[self.win._result_key(results[0].path)] = {"乙方": "张三"}
         self.win._clear_preview()
         self.assertEqual(self.win.manual_overrides, {})
         self.assertIsNone(self.win.preview_data)
@@ -134,10 +135,11 @@ class ManualOverrideTests(unittest.TestCase):
     def test_snapshot_has_ocr_keys(self):
         snap = self.win._snapshot(str(self.tmp))
         for key in ("scan_ocr_enabled", "scan_ocr_max_pages", "scan_ocr_include_last_page",
-                    "scan_ocr_dpi", "scan_ocr_max_side", "scan_ocr_timeout", "scan_ocr_lang"):
+                    "scan_ocr_dpi", "scan_ocr_max_side", "scan_ocr_timeout", "scan_ocr_lang",
+                    "scan_rapid_enabled", "sequence_counter"):
             self.assertIn(key, snap)
-        self.assertEqual(snap["scan_ocr_max_pages"], 2)
         self.assertTrue(snap["scan_ocr_enabled"])
+        self.assertTrue(snap["scan_rapid_enabled"])
 
     def test_double_click_maps_to_result(self):
         results, _, = self._fake_preview()[0], None

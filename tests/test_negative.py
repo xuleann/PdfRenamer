@@ -41,7 +41,7 @@ class NegativeSampleTests(unittest.TestCase):
                     self.assertTrue(fr.is_missing, f"{name}/{f} 不应提取到值")
                     self.assertFalse(fr.value)
                     self.assertEqual(fr.file_value, "未知")
-                self.assertNotIn("项目名称", r.fields["合同名称"].value or "")
+                self.assertNotIn("项目名称", r.fields["合同类型"].value or "")
                 rec = renamer.plan([r], p.parent)[0]
                 self.assertEqual(rec.status, "skipped", "非合同文档不得参与改名")
 
@@ -87,23 +87,6 @@ class NewRuleTests(unittest.TestCase):
         # 原有阿拉伯数字路径不退化
         self.assertEqual(normalize_date("2024年3月5日"), "2024-03-05")
         self.assertEqual(normalize_date("2023 年7 月"), "2023-07")
-
-    def test_narrative_money_regex(self):
-        f = next(x for x in MODES["contract"]["fields"] if x["name"] == "金额")
-        cases = {
-            "合同总金额为123.4567 万元": "1234567元",
-            "合同金额：¥1,200,000.00元": "1200000.00元",
-            "合同价款为人民币 8500 元": "8500元",
-        }
-        for text, expected in cases.items():
-            with self.subTest(text=text):
-                m = re.search(f["regex"], text)
-                self.assertIsNotNone(m, f"金额正则未命中: {text}")
-                self.assertEqual(normalize_money(m.group(1)), expected)
-
-    def test_money_without_digits_still_missing(self):
-        f = next(x for x in MODES["contract"]["fields"] if x["name"] == "金额")
-        self.assertIsNone(re.search(f["regex"], "合同金额：人民币 XXX 元"))
 
     def test_continuation_line_merged(self):
         text = ("预算单位：某区平安街道办事处、\n"

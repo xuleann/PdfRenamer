@@ -116,7 +116,7 @@ class FilesModeTests(unittest.TestCase):
         self.win._on_scan()
         self.assertTrue(wait_until(lambda: self.win.preview_data is not None, self.root),
                         "扫描预览超时")
-        results, records, snap, _ = self.win.preview_data
+        results, records, snap, _, _ = self.win.preview_data
         self.assertEqual(len(results), 2, "只应处理选中的 2 个文件")
         self.assertEqual(snap["output_dir"], str(self.tmp.resolve()))
 

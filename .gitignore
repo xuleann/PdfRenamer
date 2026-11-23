@@ -23,3 +23,11 @@ Thumbs.db
 Desktop.ini
 .vscode/
 .idea/
+
+# 打包产物与交付包（体积大，不进仓库）
+/dist_new/
+/交付包_*/
+_contract_p*.png
+
+# 合同样本 PDF 一律不入库（含合成样本）：用 tests/make_samples.py 本地生成
+/tests/samples/*.pdf

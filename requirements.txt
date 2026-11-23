@@ -11,8 +11,17 @@ pyinstaller==6.22.3
 # 仅文档生成期使用
 python-docx==1.2.0
 
+# ---- V1.2.0：手写体识别（可选依赖，纯本地离线，缺失时自动降级回 Windows 内置 OCR）----
+# 劳动合同/劳务合同的身份证号、期限、签订日期、用工部门常为手写体，
+# Windows 内置印刷体 OCR 识别不了，故引入 RapidOCR（ONNXRuntime 后端，本地推理，零联网）。
+# 这是「可选依赖」：不装也能跑，只是手写体识别率会下降。
+# 若需纯离线部署，请先在联网机器上 pip 下载并预置模型到本地 models/ 目录。
+rapidocr==3.10.0         # 手写/通用 OCR（Apache-2.0，自带 small 模型，离线可用）
+onnxruntime              # RapidOCR 的推理引擎（版本由 pip 自动解析兼容）
+
 # 注意：
 # 1. 不要安装 PyMuPDF>=2.0，该版本会强制拉取 onnxruntime / numpy / pymupdf-layout 等推理库，
 #    违反「软件内部不嵌 AI」的要求，也会显著放大安装包体积。
 # 2. GUI 使用 Python 标准库 tkinter，无需安装任何 GUI 框架。
-# 3. 禁止引入 torch / transformers / onnxruntime / openai / requests / httpx 等。
+# 3. RapidOCR/onnxruntime 是本地 OCR 推理（非大模型、非云端、零联网），
+#    用于提升手写体识别率；若不需手写识别，可跳过安装。
