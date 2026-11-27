@@ -251,9 +251,18 @@ class ExcelWriter:
         else:
             self._new_workbook()
 
+        # V1.6.6：这里不再立即保存、也不直接丢弃上一轮日志。
+        # 旧实现在此「清空日志 + 保存」，一旦《信息汇总.xlsx》正被 Excel 打开，
+        # 保存立刻抛 ExcelBusyError，而本轮结果一行都还没写进日志——
+        # 用户关闭 Excel 后点「恢复」补不出任何东西，只能重扫。
+        # 现在：上一轮残留日志改名保留（.prev），本轮边写边累积，由 finish() 落盘。
         rp = _rows_path(self.directory)
-        rp.write_text("", encoding="utf-8")
-        self._save()
+        try:
+            if rp.exists() and rp.stat().st_size > 0:
+                rp.replace(rp.with_suffix(rp.suffix + ".prev"))
+            rp.write_text("", encoding="utf-8")
+        except Exception:
+            pass
 
     def _save(self) -> None:
         if self.wb is None:
@@ -262,8 +271,9 @@ class ExcelWriter:
             self.wb.save(self.path)
         except PermissionError as exc:
             raise ExcelBusyError(
-                "无法保存「信息汇总.xlsx」：文件可能正被 Excel 打开。请关闭后重试，"
-                "本轮结果已保存在还原日志中，可用「恢复上次结果」补写。"
+                "无法保存「信息汇总.xlsx」：该文件正被 Excel 打开。\n\n"
+                "请先关闭 Excel，然后点下方「恢复」按钮——本轮结果"
+                "（含手写原图）会直接补写进表格，不需要重新扫描。"
             ) from exc
 
     def build_row(self, result: ExtractResult, record: RenameRecord | None) -> dict:
@@ -324,6 +334,14 @@ class ExcelWriter:
             f.write(json.dumps({"mode": self.mode, "row": row}, ensure_ascii=False) + "\n")
         if save:
             self._save()
+            # V1.6.6：记下「已成功落盘的行数」。若后面的行因 Excel 被占用而失败，
+            # 「恢复」只需补写这个数之后的行，前面已进表的不再重复追加。
+            try:
+                with _rows_path(self.directory).open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"mode": self.mode, "saved": self.rows_written},
+                                       ensure_ascii=False) + "\n")
+            except Exception:
+                pass
 
     # V1.3.6：截图显示尺寸上限（像素）。手写截图是横向长条，
     # 必须同时约束宽和高，否则图片会横跨多列、盖住相邻单元格（用户实测反馈）。
@@ -401,8 +419,16 @@ class ExcelWriter:
     def finish(self) -> None:
         if self.ws is not None and self.ws.max_row >= 1:
             self.ws.auto_filter.ref = f"A1:{get_column_letter(len(self.header))}{self.ws.max_row}"
-        self._save()
-        self._cleanup_images()  # 图片已写入 xlsx，删除系统临时目录
+        try:
+            self._save()
+        finally:
+            self._cleanup_images()  # 图片已写入 xlsx，删除系统临时目录
+        # V1.6.6：确认写入成功后才清空本轮增量日志，避免再点「恢复」重复追加。
+        # 保存失败走不到这里，日志保持完整，供「恢复」补写。
+        try:
+            _rows_path(self.directory).write_text("", encoding="utf-8")
+        except Exception:
+            pass
 
 
 def has_recoverable_rows(directory: str | Path) -> bool:
@@ -410,38 +436,75 @@ def has_recoverable_rows(directory: str | Path) -> bool:
     return rp.exists() and rp.stat().st_size > 0
 
 
+def _recover_field_images(directory: Path, row: dict, image_fields: list[str],
+                          missing_value: str) -> dict[str, bytes]:
+    """恢复时重截该行的手写原图（日志不存图片字节，只能按命名回找 PDF 重截）。"""
+    cands = []
+    for key in ("新文件名", "原文件名"):
+        name = str(row.get(key, "") or "").strip()
+        if name and name != "（未改名）":
+            cands.append(directory / name)
+    path = next((p for p in cands if p.exists()), None)
+    if path is None:
+        return {}
+    try:
+        from .extractor.field_crop import FIELD_ANCHORS, crop_field_images
+        from .rules import suspect_field_value
+        targets = []
+        for nm in image_fields:
+            if nm not in FIELD_ANCHORS:
+                continue
+            val = str(row.get(result_col_name(nm), row.get(nm, "")) or "")
+            if not val or val == missing_value or suspect_field_value(nm, val):
+                targets.append(nm)
+        if not targets:
+            return {}
+        return crop_field_images(path, targets)
+    except Exception:
+        return {}
+
+
 def recover_rows(directory: str | Path, mode: str, sheet_name: str, mode_label: str,
                  field_names: list[str], missing_value: str = "未知") -> int:
-    """从 rows.jsonl 重建本轮结果（Excel 被占用 / 中途崩溃后使用）。"""
+    """从 rows.jsonl 补写本轮尚未落盘的结果（Excel 被占用 / 中途失败后使用）。
+
+    V1.6.6：日志里混有两类记录——行数据 ``{"row": ...}`` 与已成功落盘的计数
+    ``{"saved": n}``。只补写 ``n`` 之后的行，避免把已经在表里的行再追加一遍。
+    """
     rp = _rows_path(directory)
     if not rp.exists():
         return 0
-    rows = []
+    rows: list[dict] = []
+    saved = 0
     for line in rp.read_text(encoding="utf-8").splitlines():
         try:
             d = json.loads(line)
-            if d.get("mode") == mode:
-                rows.append(d["row"])
-        except (ValueError, KeyError):
+        except ValueError:
             continue
-    if not rows:
+        if not isinstance(d, dict) or d.get("mode") != mode:
+            continue
+        if "row" in d:
+            rows.append(d["row"])
+        elif "saved" in d:
+            try:
+                saved = max(saved, int(d["saved"] or 0))
+            except (TypeError, ValueError):
+                pass
+    pending = rows[min(saved, len(rows)):]
+    if not pending:
         return 0
     # V1.1.0 及以前的 jsonl 行没有「PDF 类型」键，补齐后写回保持一致
     for row in rows:
         row.setdefault("PDF 类型", mode_label)
     w = ExcelWriter(directory, mode, sheet_name, mode_label, field_names,
                     missing_value, strategy="append")
-    w.prepare()
-    # prepare 会清空 jsonl，这里改为从内存写回，避免数据丢失
-    for row in rows:
-        values = [row.get(h, "") for h in w.header]
-        w.ws.append(values)
-        w.rows_written += 1
-    with rp.open("a", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps({"mode": mode, "row": row}, ensure_ascii=False) + "\n")
+    w.prepare()   # 行已读进内存，这里清空/转存旧日志是安全的
+    # 走 append_row：缺失值配色、列宽行高、手写原图与正常执行保持一致
+    for row in pending:
+        imgs = _recover_field_images(Path(directory), row, w.image_fields, missing_value)
+        w.append_row(row, field_images=imgs, save=False)
     w.finish()
-    return len(rows)
+    return len(pending)
 
 
 def _cell_text(cell) -> str:

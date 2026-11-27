@@ -944,9 +944,29 @@ class MainWindow:
         snap = self._snapshot(d)
         mc = snap["mode_cfg"]
         names = [f["name"] for f in mc["fields"] if f.get("enabled", True)]
-        n = recover_rows(d, snap["mode"], mc["sheet"], mc["label"], names, snap["missing_value"])
-        self._log(f"已从增量日志补写 {n} 行到 Excel。")
-        messagebox.showinfo("恢复结果", f"已从上次运行的增量日志补写 {n} 行到 Excel。", parent=self.root)
+        # V1.6.6：恢复也要处理「Excel 还没关」——明确提示，而不是静默失败。
+        try:
+            n = recover_rows(d, snap["mode"], mc["sheet"], mc["label"], names,
+                             snap["missing_value"])
+        except ExcelBusyError as exc:
+            self._log("恢复失败：Excel 仍被占用。")
+            messagebox.showwarning("Excel 仍被占用", str(exc), parent=self.root)
+            return
+        except Exception:
+            detail = traceback.format_exc()
+            self._log("恢复出错：\n" + detail)
+            messagebox.showerror("恢复失败", detail[-1500:], parent=self.root)
+            return
+        if n:
+            self._log(f"已从增量日志补写 {n} 行到 Excel（含手写截图）。")
+            messagebox.showinfo("恢复完成",
+                                f"已把上次未写入的 {n} 条结果补进「信息汇总.xlsx」，"
+                                "无需重新扫描。", parent=self.root)
+        else:
+            self._log("没有可恢复的记录（上次已成功写入，或日志已过期）。")
+            messagebox.showinfo("没有可恢复的记录",
+                                "没有找到待补写的记录。\n"
+                                "如果表格里确实缺数据，请重新扫描一次。", parent=self.root)
 
     # ------------------------------------------------------------------ 队列回灌
     def _drain(self):

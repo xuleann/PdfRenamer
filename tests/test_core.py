@@ -246,11 +246,10 @@ class PipelineTests(unittest.TestCase):
 
     def test_rows_jsonl_recovery(self):
         self._run("append")
-        self.assertTrue(has_recoverable_rows(self.tmp))
-        mc = MODES["contract"]
-        names = [f["name"] for f in mc["fields"]]
-        n = recover_rows(self.tmp, "contract", mc["sheet"], mc["label"], names, "未知")
-        self.assertGreater(n, 0)
+        # V1.6.6：正常写入成功后增量日志即清空——否则再点「恢复」会把同一批行
+        # 重复追加进表格。写入失败（Excel 被占用）时日志才保留，
+        # 恢复场景见 tests/test_v166_recover.py。
+        self.assertFalse(has_recoverable_rows(self.tmp))
 
 
 if __name__ == "__main__":
