@@ -675,6 +675,26 @@ def unique_name(name: str, used_lower: set[str]) -> str:
     return candidate
 
 
+# ---------------------------------------------------------------------------
+# V1.4.9：乙方提取可信度判定（重命名占位符 + Excel 截图共用同一口径）
+# ---------------------------------------------------------------------------
+def needs_review(name: str, value: str, status: str) -> bool:
+    """字段是否需要人工核对。
+
+    status 取自 models 的 ST_* 常量（字符串）。规则：
+    - manual（人工补录）永远可信；
+    - ok/fallback 且值通过 suspect_field_value 校验 → 可信；
+    - 其余（missing/heuristic/可疑值）→ 需要核对。
+    """
+    if status == "manual":
+        return False
+    if not value:
+        return True
+    if status not in ("ok", "fallback"):
+        return True
+    return suspect_field_value(name, value)
+
+
 # V1.3.8：判断一个"已识别"的字段值是否可疑——状态虽 OK 但值明显错误时，
 # 也应放截图供人工核对（避免"错值既不是正确文字、又不给截图"的最差情况）。
 def suspect_field_value(name: str, value: str) -> bool:

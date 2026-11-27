@@ -24,6 +24,7 @@ from ..models import (DOC_OK, DOC_PARTIAL, FieldResult, SKIP_DOC_STATUSES,
                       ST_MANUAL, ST_MISSING, ST_HEURISTIC)
 from ..presets import MODES, MODE_CONTRACT, MODE_PAPER
 from ..renamer import RenameEngine
+from ..review import assign_review_codes
 from ..rules import clean_value, normalize_by_type, to_filename_value
 from ..undo import UndoManager
 from . import theme
@@ -292,10 +293,10 @@ class MainWindow:
         # 底部：按钮 / 进度 / 日志
         bottom = ttk.Frame(outer)
         bottom.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        self.btn_scan = ttk.Button(bottom, text="① 扫描并预览", command=self._on_scan,
+        self.btn_scan = ttk.Button(bottom, text="① 扫描并导出复核表", command=self._on_scan,
                                    style="Accent.TButton")
         self.btn_scan.pack(side="left")
-        self.btn_exec = ttk.Button(bottom, text="② 确认执行（改名 + 导出 Excel）",
+        self.btn_exec = ttk.Button(bottom, text="② 按复核表改名",
                                    command=self._on_execute, state="disabled",
                                    style="Accent.TButton")
         self.btn_exec.pack(side="left", padx=6)
@@ -524,9 +525,10 @@ class MainWindow:
             "scan_ocr_max_side": cfg.get("scan_ocr_max_side", 2400),
             "scan_ocr_timeout": cfg.get("scan_ocr_timeout", 60),
             "scan_ocr_lang": cfg.get("scan_ocr_lang", "auto"),
-            # V1.2.0：RapidOCR 手写识别开关 + 全局序号计数器
+            # V1.2.0：RapidOCR 手写识别开关
             "scan_rapid_enabled": bool(cfg.get("scan_rapid_enabled", True)),
-            "sequence_counter": int(cfg.get("sequence_counter", 1) or 1),
+            # V1.5.0：序号每批都从 01 开始（不再跨批全局递增）
+            "sequence_counter": 1,
             # V1.3.0：手写字段截图嵌入 Excel 开关
             "capture_field_images": bool(cfg.get("capture_field_images", True)),
         }
@@ -584,14 +586,72 @@ class MainWindow:
             )
             results = engine.extract_many(
                 files, progress=lambda i, t, n: self.q.put(("progress", i, t, f"提取 {n}")))
+            # V1.4.9：合同模式下为不可信的乙方分配 xx1/xx2 核对占位符。
+            if snap["mode"] == MODE_CONTRACT:
+                try:
+                    assign_review_codes(results)
+                except Exception:
+                    pass
             renamer = RenameEngine(snap["template"], snap["missing_value"], snap["max_len"],
                                    sequence_start=snap["sequence_counter"])
             names = [f["name"] for f in snap["mode_cfg"]["fields"] if f.get("enabled", True)]
             records = renamer.plan(results, directory)
+
+            # V1.6.0：扫描阶段就把识别结果 + 六字段截图写进复核表（此时改名未发生，
+            # 原路径有效），人工直接在 Excel 结果列复核修改。
+            mc = snap["mode_cfg"]
+            writer = ExcelWriter(directory, snap["mode"], mc["sheet"], mc["label"], names,
+                                 snap["missing_value"], snap["strategy"])
+            writer.prepare()
+            image_fields = tuple(writer.image_fields)
+            total = max(1, len(results))
+            for i, (r, rec) in enumerate(zip(results, records), 1):
+                imgs = self._capture_one(r, snap, names) if r.doc_status not in SKIP_DOC_STATUSES else {}
+                # 逐行 save：实测带图场景比攒到最后一次 save 更快
+                # （openpyxl 逐次固化已写图片，避免末尾一次性序列化全部图片）
+                writer.append_row(writer.build_row(r, rec), imgs)
+                self.q.put(("progress", i, total, f"写复核表 {r.original_name}"))
+            writer.finish()
+
+            snap["image_fields"] = image_fields
             self.q.put(("preview", results, records, renamer.unknown_placeholders(names),
                         snap, renamer.next_sequence))
+        except ExcelBusyError as exc:
+            self.q.put(("excel_busy", str(exc)))
         except Exception:
             self.q.put(("error", traceback.format_exc()))
+
+    def _capture_images(self, results: list, snap: dict, names: list[str]) -> dict[str, dict]:
+        """批量截图（供其它入口复用）：{规范化路径: {字段: 图片字节}}。"""
+        out: dict[str, dict] = {}
+        for r in results:
+            if r.doc_status in SKIP_DOC_STATUSES:
+                continue
+            imgs = self._capture_one(r, snap, names)
+            if imgs:
+                out[str(r.path)] = imgs
+        return out
+
+    def _capture_one(self, r, snap: dict, names: list[str]) -> dict[str, bytes]:
+        """对单个 PDF 截图：V1.6.0 起六字段都截（放进各自原件图列），
+        乙方固定首页、用工部门按锚点；自检失败静默跳过，绝不影响扫描。"""
+        if not snap.get("capture_field_images", True) or snap["mode"] != MODE_CONTRACT:
+            return {}
+        try:
+            from ..extractor.field_crop import FIELD_ANCHORS, crop_field_images
+            targets = [n for n in names if n in FIELD_ANCHORS]
+            if not targets:
+                return {}
+            # V1.6.1：乙方固定第 1 页、签订日期固定末页（-1）签章区；
+            # 开始/结束日期按日期数字定位（不限页）。
+            page_map: dict[str, list[int]] = {}
+            if "乙方" in targets:
+                page_map["乙方"] = [0]
+            if "签订日期" in targets:
+                page_map["签订日期"] = [-1]
+            return crop_field_images(r.path, targets, field_pages=page_map or None)
+        except Exception:
+            return {}
 
     def _fill_preview(self, results, records, warnings, snap, next_sequence=None):
         self.pv_tree.delete(*self.pv_tree.get_children())
@@ -612,10 +672,10 @@ class MainWindow:
             ), tags=tuple(tags))
         self.preview_data = (results, records, snap, warnings, next_sequence)
         self.btn_exec.config(state="normal")
-        self._log(f"预览完成：{len(results)} 个文件，"
+        self._log(f"复核表已生成：{len(results)} 行，"
                   f"待改名 {sum(1 for x in records if x.status == 'planned')} 个，"
                   f"跳过 {sum(1 for x in records if x.status == 'skipped')} 个"
-                  "｜双击行可补录字段。")
+                  "｜请打开 Excel 核对结果列，改完点「② 按复核表改名」。")
         if warnings:
             self._log("警告：模板存在未知字段 " + "、".join(sorted(set(warnings))))
 
@@ -747,91 +807,115 @@ class MainWindow:
     def _on_execute(self):
         if self.busy or not self.preview_data:
             return
-        self._apply_overrides()          # 执行前再应用一次，确保补录值生效
         results, records, snap, _, next_seq = self.preview_data
         d = snap.get("output_dir") or self.dir_var.get().strip()
-        n = sum(1 for x in records if x.status == "planned")
+        xlsx = Path(d) / "信息汇总.xlsx"
+        if not xlsx.exists():
+            messagebox.showwarning(
+                "找不到复核表",
+                f"未找到复核表：\n{xlsx}\n\n请先点「① 扫描并导出复核表」。",
+                parent=self.root)
+            return
         if not messagebox.askyesno(
-                "确认执行",
-                f"即将对 {n} 个 PDF 原地重命名，并在\n{d}\n生成/追加「信息汇总.xlsx」。\n\n"
-                "执行前会写入还原日志，之后可用「撤销上次重命名」恢复。\n\n确认执行？",
+                "按复核表改名",
+                f"将读取你复核后的表格：\n{xlsx}\n\n"
+                "按表中「乙方 / 身份证号 / 日期 / 用工部门」等结果列的值改名，\n"
+                "并只更新表里的「新文件名」列（不会覆盖你改过的字段值）。\n\n"
+                "确认已保存并关闭 Excel，继续改名？",
                 parent=self.root):
             return
         self._set_busy(True)
-        self._log("开始执行：写入还原日志 → 重命名 → 导出 Excel…")
-        # V1.2.0：序号全局单调递增——确认执行后立即占用本次分配的序号并落盘，
-        # 即使后续执行失败/撤销，序号也不回退。
-        if next_seq is not None:
-            self.cfg["sequence_counter"] = int(next_seq)
-            try:
-                save_config(self.cfg)
-            except Exception:
-                pass
+        self._log("开始按复核表改名：读取 Excel → 重新生成改名计划 → 重命名 → 更新新文件名列…")
+        # 预览表双击补录的值优先级高于 Excel（两者通常不会同时改同一字段）
+        snap["manual_overrides"] = deepcopy(self.manual_overrides)
         rid = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        threading.Thread(target=self._execute_worker, args=(d, results, records, snap, rid),
+        threading.Thread(target=self._execute_worker, args=(d, results, snap, rid),
                          daemon=True).start()
 
-    def _execute_worker(self, directory, results, records, snap, rid):
+    def _execute_worker(self, directory, results, snap, rid):
+        """V1.6.0：按人工复核后的 Excel 值改名（不再截图、不再重写整表）。"""
         try:
-            undo = UndoManager()
-            undo.save_plan(directory, snap["mode"], records, rid)   # 改名前先落盘
+            from ..excel import read_reviewed_values, update_excel_after_rename
 
-            # V1.3.7：只对「识别不可信」的字段截图——正则可靠命中的(ST_OK)显示文字即可，
-            # 缺失/启发式猜测/关键词兜底的才截图供人工核对。表格更干净、文件更小。
-            # 截图在改名前现算（改名后原路径失效），放在执行阶段不拖慢扫描预览。
-            field_images_by_path: dict[str, dict] = {}
-            if snap.get("capture_field_images", True) and snap["mode"] == "contract":
-                try:
-                    from ..extractor.field_crop import FIELD_ANCHORS, crop_field_images
-                    eligible = [f["name"] for f in snap["mode_cfg"]["fields"]
-                                if f.get("enabled", True) and f.get("name") in FIELD_ANCHORS]
-                    from ..rules import suspect_field_value
-                    for r in results:
-                        if r.doc_status in SKIP_DOC_STATUSES:
-                            continue
-                        # 截「不可信」字段：状态非OK，或值明显可疑（错值也算没识别准）。
-                        # 认准的字段不贴图——表格保持干净；只有缺失/串字/可疑的才把原图摆出来。
-                        targets = []
-                        for nm in eligible:
-                            fr = r.fields.get(nm)
-                            unreliable = (fr is None or fr.is_missing
-                                          or fr.status in (ST_MISSING, ST_HEURISTIC)
-                                          or fr.status not in ("ok", ST_MANUAL))
-                            if not unreliable and suspect_field_value(nm, fr.value):
-                                unreliable = True   # 状态OK但值可疑（如乙方=单位名/串字）
-                            if unreliable:
-                                targets.append(nm)
-                        if targets:
-                            imgs = crop_field_images(r.path, targets)
-                            if imgs:
-                                field_images_by_path[str(r.path)] = imgs
-                except Exception:
-                    pass
-
-            renamer = RenameEngine(snap["template"], snap["missing_value"], snap["max_len"])
-            renamer.execute(
-                records, progress=lambda i, t, n: self.q.put(("progress", i, t, f"改名 {n}")))
-            undo.save_plan(directory, snap["mode"], records, rid)   # 更新最终状态
-
+            # 1) 读回人工复核值，覆盖识别结果（只覆盖表中非空的字段）
             mc = snap["mode_cfg"]
             names = [f["name"] for f in mc["fields"] if f.get("enabled", True)]
-            writer = ExcelWriter(directory, snap["mode"], mc["sheet"], mc["label"], names,
-                                 snap["missing_value"], snap["strategy"])
-            writer.prepare()
-            for i, (r, rec) in enumerate(zip(results, records), 1):
-                writer.append_row(writer.build_row(r, rec),
-                                  field_images_by_path.get(str(r.path)))
-                self.q.put(("progress", i, len(results), f"写入 Excel {r.original_name}"))
-            writer.finish()
+            xlsx = Path(directory) / "信息汇总.xlsx"
+            reviewed = read_reviewed_values(xlsx, mc["sheet"], names)
+            applied = 0
+            field_types = {f["name"]: str(f.get("type", "text")) for f in mc["fields"]}
+            field_maxlen = {f["name"]: int(f.get("max_len", 0) or 0) for f in mc["fields"]}
+            for r in results:
+                vals = reviewed.get(r.original_name)
+                if not vals:
+                    continue
+                for fname, raw in vals.items():
+                    if not raw or fname not in field_types:
+                        continue
+                    # 复核表里 xxN 占位符是"未核对"，保留原占位不覆盖
+                    if raw.startswith("xx") and raw[2:].isdigit():
+                        continue
+                    ftype = field_types[fname]
+                    display = normalize_by_type(raw, ftype) or clean_value(raw)
+                    if not display:
+                        continue
+                    r.fields[fname] = FieldResult(
+                        fname, display,
+                        to_filename_value(display, ftype, field_maxlen.get(fname, 0))
+                        or snap["missing_value"],
+                        ST_MANUAL, "人工复核")
+                    applied += 1
+
+            # 预览表双击补录的值优先级最高（覆盖 Excel 同名字段）
+            overrides = snap.get("manual_overrides") or {}
+            for r in results:
+                key = str(Path(r.path).resolve()).lower()
+                ov = overrides.get(key)
+                if not ov:
+                    continue
+                for fname, raw in ov.items():
+                    if not raw or fname not in field_types:
+                        continue
+                    ftype = field_types[fname]
+                    display = normalize_by_type(raw, ftype) or clean_value(raw)
+                    if not display:
+                        continue
+                    r.fields[fname] = FieldResult(
+                        fname, display,
+                        to_filename_value(display, ftype, field_maxlen.get(fname, 0))
+                        or snap["missing_value"],
+                        ST_MANUAL, "人工补录")
+                    applied += 1
+            self.q.put(("log", f"已从复核表/补录应用 {applied} 处人工修改"))
+
+            # 2) 用复核后的结果重新生成改名计划
+            renamer = RenameEngine(snap["template"], snap["missing_value"], snap["max_len"],
+                                   sequence_start=snap.get("sequence_counter", 1))
+            records = renamer.plan(results, directory)
+
+            # 3) 改名前写还原日志 → 执行改名 → 更新日志状态
+            undo = UndoManager()
+            undo.save_plan(directory, snap["mode"], records, rid)
+            renamer.execute(
+                records, progress=lambda i, t, n: self.q.put(("progress", i, t, f"改名 {n}")))
+            undo.save_plan(directory, snap["mode"], records, rid)
+
+            # 4) 只更新 Excel 的「新文件名」列，保留人工复核值与截图
+            final_names = {
+                rec.original: rec.new_name for rec in records
+                if rec.status in ("planned", "done", "unchanged")
+            }
+            try:
+                update_excel_after_rename(xlsx, mc["sheet"], final_names)
+            except Exception:
+                pass   # 改名已完成，Excel 列更新失败不影响改名结果
 
             done = sum(1 for x in records if x.status == "done")
             failed = sum(1 for x in records if x.status == "failed")
             skipped = sum(1 for x in records if x.status == "skipped")
             self.q.put(("done",
                         f"完成：改名 {done} 个，跳过 {skipped} 个，失败 {failed} 个；"
-                        f"Excel 已输出到 {directory}\\信息汇总.xlsx"))
-        except ExcelBusyError as exc:
-            self.q.put(("excel_busy", str(exc)))
+                        f"复核表已更新新文件名：{xlsx}"))
         except Exception:
             self.q.put(("error", traceback.format_exc()))
 
@@ -880,7 +964,16 @@ class MainWindow:
                 elif kind == "preview":
                     self._fill_preview(msg[1], msg[2], msg[3], msg[4], msg[5] if len(msg) > 5 else None)
                     self._set_busy(False)
-                    self.status_var.set("预览完成，请核对后点「② 确认执行」")
+                    self.status_var.set("复核表已生成，请打开 Excel 复核，改完保存关闭后点「② 按复核表改名」")
+                    messagebox.showinfo(
+                        "请人工复核",
+                        "扫描完成！已生成《信息汇总.xlsx》复核表。\n\n"
+                        "请打开该表格，逐行核对并直接修改结果列\n"
+                        "（乙方 / 身份证号 / 开始日期 / 结束日期 / 签订日期 / 用工部门），\n"
+                        "右侧图片列是该字段的原件截图供对照。\n\n"
+                        "改完保存并关闭 Excel 后，回到软件点\n"
+                        "「② 按复核表改名」即可按你改过的内容改名。",
+                        parent=self.root)
                 elif kind == "done":
                     self.pb["value"] = 100
                     self._log(msg[1])

@@ -24,8 +24,8 @@ echo [3/4] Exporting default config
 "%PY%" -c "import sys;sys.path.insert(0,r'%ROOT%\src');from pdfrenamer.config import export_defaults;from pathlib import Path;export_defaults(Path(r'%ROOT%\config\default_config.json'))"
 if errorlevel 1 goto :fail
 
-echo [4/4] PyInstaller
-"%PY%" -m PyInstaller --clean --noconfirm --distpath "%ROOT%\dist" --workpath "%ROOT%\build\work" "%~dp0PdfRenamer.spec"
+echo [4/4] PyInstaller (full spec: includes RapidOCR/ONNXRuntime for handwriting OCR)
+"%PY%" -m PyInstaller --clean --noconfirm --distpath "%ROOT%\dist" --workpath "%ROOT%\build\work" "%~dp0PdfRenamer_full.spec"
 if errorlevel 1 goto :fail
 
 echo OK -^> %ROOT%\dist\PdfRenamer.exe

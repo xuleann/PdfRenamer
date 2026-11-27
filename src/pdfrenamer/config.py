@@ -123,9 +123,11 @@ def _validate(cfg: dict) -> dict:
     cfg["scan_ocr_max_side"] = max(800, min(2600, int(cfg.get("scan_ocr_max_side", 2400) or 2400)))
     cfg["scan_ocr_timeout"] = max(10, min(180, int(cfg.get("scan_ocr_timeout", 60) or 60)))
     cfg["scan_ocr_lang"] = str(cfg.get("scan_ocr_lang") or "auto")
-    # V1.2.0：RapidOCR 手写识别开关 + 全局序号计数器
+    # V1.2.0：RapidOCR 手写识别开关
     cfg["scan_rapid_enabled"] = bool(cfg.get("scan_rapid_enabled", True))
-    cfg["sequence_counter"] = max(1, int(cfg.get("sequence_counter", 1) or 1))
+    # V1.5.0：序号每批从 01 开始，不再跨批递增。
+    # 保留该键仅为兼容旧配置（旧版可能存了 4/5 等），读取时归一化为 1。
+    cfg["sequence_counter"] = 1
     # V1.3.0：手写字段截图嵌入 Excel 开关（默认开，不覆盖用户显式关闭值）
     if "capture_field_images" not in cfg:
         cfg["capture_field_images"] = True

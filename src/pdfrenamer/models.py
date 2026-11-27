@@ -84,6 +84,9 @@ class FieldResult:
     file_value: str = ""
     status: str = ST_MISSING
     note: str = ""
+    # V1.4.9：提取不可信时分配的核对占位符（如乙方 xx1/xx2），
+    # 用于重命名与 Excel 展示，人工补录后自动清空。空串表示未分配。
+    review_code: str = ""
 
     @property
     def is_missing(self) -> bool:

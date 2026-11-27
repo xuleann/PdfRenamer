@@ -4,7 +4,7 @@
 ; Output : <project-root>\dist\PdfRenamer_setup.exe
 ; ============================================================
 #define MyAppName "PdfRenamer"
-#define MyAppVersion "1.1.2"
+#define MyAppVersion "1.6.5"
 #define MyAppPublisher "Local Desktop Tool"
 #define MyAppURL "https://localhost/"
 #define MyAppExeName "PdfRenamer.exe"
