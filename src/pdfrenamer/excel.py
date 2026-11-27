@@ -464,6 +464,25 @@ def _recover_field_images(directory: Path, row: dict, image_fields: list[str],
         return {}
 
 
+def load_rows_from_log(directory: str | Path, mode: str) -> list[dict]:
+    """读取增量日志里属于该模式的所有行（不改文件、不清日志）。
+
+    供「恢复」补写 Excel 与「从日志重建预览」共用。
+    """
+    rp = _rows_path(directory)
+    if not rp.exists():
+        return []
+    rows: list[dict] = []
+    for line in rp.read_text(encoding="utf-8").splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("mode") == mode and "row" in d:
+            rows.append(d["row"])
+    return rows
+
+
 def recover_rows(directory: str | Path, mode: str, sheet_name: str, mode_label: str,
                  field_names: list[str], missing_value: str = "未知") -> int:
     """从 rows.jsonl 补写本轮尚未落盘的结果（Excel 被占用 / 中途失败后使用）。

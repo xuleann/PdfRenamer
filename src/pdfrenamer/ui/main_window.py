@@ -18,10 +18,11 @@ import tkinter as tk
 from .. import __version__
 from ..config import appdata_dir, load_config, resource_path, save_config
 from ..engine import ExtractEngine, list_pdfs, check_same_parent, normalize_pdf_paths
-from ..excel import ExcelBusyError, ExcelWriter, recover_rows
+from ..excel import (ExcelBusyError, ExcelWriter, load_rows_from_log, recover_rows,
+                     result_col_name)
 from ..extractor import available_backends
-from ..models import (DOC_OK, DOC_PARTIAL, FieldResult, SKIP_DOC_STATUSES,
-                      ST_MANUAL, ST_MISSING, ST_HEURISTIC)
+from ..models import (DOC_NOT_CONTRACT, DOC_OK, DOC_PARTIAL, ExtractResult, FieldResult,
+                      SKIP_DOC_STATUSES, ST_MANUAL, ST_MISSING, ST_HEURISTIC, ST_OK)
 from ..presets import MODES, MODE_CONTRACT, MODE_PAPER
 from ..renamer import RenameEngine
 from ..review import assign_review_codes
@@ -605,17 +606,41 @@ class MainWindow:
             writer.prepare()
             image_fields = tuple(writer.image_fields)
             total = max(1, len(results))
+            excel_busy = False
             for i, (r, rec) in enumerate(zip(results, records), 1):
                 imgs = self._capture_one(r, snap, names) if r.doc_status not in SKIP_DOC_STATUSES else {}
                 # 逐行 save：实测带图场景比攒到最后一次 save 更快
                 # （openpyxl 逐次固化已写图片，避免末尾一次性序列化全部图片）
-                writer.append_row(writer.build_row(r, rec), imgs)
+                row = writer.build_row(r, rec)
+                if excel_busy:
+                    writer.append_row(row, imgs, save=False)   # 只进增量日志
+                else:
+                    try:
+                        writer.append_row(row, imgs)
+                    except ExcelBusyError:
+                        # V1.6.6：这一行已进内存表与增量日志，只是落盘失败。
+                        # 不打断扫描——否则关掉 Excel 后用户还得从头再扫一遍。
+                        excel_busy = True
+                        self.q.put(("log", "Excel 正被打开：复核表暂未写入，"
+                                           "关闭 Excel 后点「恢复」即可补写，不必重新扫描。"))
                 self.q.put(("progress", i, total, f"写复核表 {r.original_name}"))
-            writer.finish()
+            if not excel_busy:
+                try:
+                    writer.finish()
+                except ExcelBusyError:
+                    excel_busy = True
+                    self.q.put(("log", "Excel 正被打开：复核表未保存。"
+                                       "关闭 Excel 后点「恢复」即可补写，不必重新扫描。"))
+            else:
+                writer._cleanup_images()
 
             snap["image_fields"] = image_fields
+            snap["excel_busy"] = excel_busy
             self.q.put(("preview", results, records, renamer.unknown_placeholders(names),
                         snap, renamer.next_sequence))
+            if excel_busy:
+                self.q.put(("log", "扫描已完成，但复核表还没写进 Excel：请先关闭 Excel，"
+                                   "点「恢复」补写后再执行改名。"))
         except ExcelBusyError as exc:
             self.q.put(("excel_busy", str(exc)))
         except Exception:
@@ -671,7 +696,12 @@ class MainWindow:
                 (r.skip_reason or rec.reason or r.note or "")[:120],
             ), tags=tuple(tags))
         self.preview_data = (results, records, snap, warnings, next_sequence)
-        self.btn_exec.config(state="normal")
+        if (snap or {}).get("excel_busy"):
+            # 复核表没写进 Excel 时不允许执行改名：否则读回复核值会读到旧表
+            self.btn_exec.config(state="disabled")
+            self.status_var.set("复核表未写入 Excel：关闭 Excel 后点「恢复」再执行")
+        else:
+            self.btn_exec.config(state="normal")
         self._log(f"复核表已生成：{len(results)} 行，"
                   f"待改名 {sum(1 for x in records if x.status == 'planned')} 个，"
                   f"跳过 {sum(1 for x in records if x.status == 'skipped')} 个"
@@ -806,6 +836,13 @@ class MainWindow:
     # ------------------------------------------------------------------ 执行
     def _on_execute(self):
         if self.busy or not self.preview_data:
+            return
+        if (self.preview_data[2] or {}).get("excel_busy"):
+            messagebox.showwarning(
+                "复核表还没写进 Excel",
+                "本轮复核表写入失败（Excel 正被打开）。\n\n"
+                "请先关闭「信息汇总.xlsx」，点下方「恢复」补写，再执行改名。\n"
+                "不需要重新扫描。", parent=self.root)
             return
         results, records, snap, _, next_seq = self.preview_data
         d = snap.get("output_dir") or self.dir_var.get().strip()
@@ -944,7 +981,18 @@ class MainWindow:
         snap = self._snapshot(d)
         mc = snap["mode_cfg"]
         names = [f["name"] for f in mc["fields"] if f.get("enabled", True)]
-        # V1.6.6：恢复也要处理「Excel 还没关」——明确提示，而不是静默失败。
+
+        # V1.6.6：先读增量日志。若扫描没走完（预览为空），用日志把结果重建回界面，
+        # 让用户恢复后可以直接执行改名，而不是被迫重扫。
+        try:
+            rows = load_rows_from_log(d, snap["mode"])
+        except Exception:
+            rows = []
+        rebuilt = False
+        if not self.preview_data and rows:
+            rebuilt = self._restore_preview_from_rows(d, snap, rows, names)
+
+        # 恢复也要处理「Excel 还没关」——明确提示，而不是静默失败。
         try:
             n = recover_rows(d, snap["mode"], mc["sheet"], mc["label"], names,
                              snap["missing_value"])
@@ -957,16 +1005,76 @@ class MainWindow:
             self._log("恢复出错：\n" + detail)
             messagebox.showerror("恢复失败", detail[-1500:], parent=self.root)
             return
+
+        # 补写成功后解除「不许执行」的锁
+        if self.preview_data and len(self.preview_data) > 2:
+            self.preview_data[2]["excel_busy"] = False
+            self.btn_exec.config(state="normal")
+            self.status_var.set("复核表已补写，可以执行改名")
+
         if n:
             self._log(f"已从增量日志补写 {n} 行到 Excel（含手写截图）。")
+            extra = "\n预览也已恢复，可直接点「按复核表改名」。" if rebuilt else ""
             messagebox.showinfo("恢复完成",
                                 f"已把上次未写入的 {n} 条结果补进「信息汇总.xlsx」，"
-                                "无需重新扫描。", parent=self.root)
+                                f"无需重新扫描。{extra}", parent=self.root)
+        elif rebuilt:
+            self._log("已从增量日志恢复预览，可继续执行改名。")
+            messagebox.showinfo("已恢复",
+                                "结果已在表格里，预览也已重建，可直接点「按复核表改名」。",
+                                parent=self.root)
         else:
             self._log("没有可恢复的记录（上次已成功写入，或日志已过期）。")
             messagebox.showinfo("没有可恢复的记录",
                                 "没有找到待补写的记录。\n"
                                 "如果表格里确实缺数据，请重新扫描一次。", parent=self.root)
+
+    def _restore_preview_from_rows(self, directory: str, snap: dict, rows: list[dict],
+                                   names: list[str]) -> bool:
+        """用增量日志重建预览（扫描中途失败、window 里没有结果时用）。
+
+        只能还原表格里已有的值，无法还原被判定为「非合同」等细节状态——
+        因此对原本「未改名」的行按跳过处理，避免恢复后被误改名。
+        """
+        cfg_by_name = {f["name"]: f for f in snap["mode_cfg"]["fields"]
+                       if f.get("enabled", True)}
+        base = Path(directory)
+        results: list[ExtractResult] = []
+        for row in rows:
+            path = base / str(row.get("原文件名") or "")
+            if not path.exists():
+                alt = str(row.get("新文件名") or "").strip()
+                if alt and alt != "（未改名）":
+                    path = base / alt
+            if not path.exists():
+                continue
+            skipped = str(row.get("新文件名") or "").strip() in ("（未改名）", "")
+            fields: dict[str, FieldResult] = {}
+            for fname in names:
+                cfg = cfg_by_name.get(fname, {})
+                raw = row.get(result_col_name(fname), row.get(fname, ""))
+                val = str(raw or "").strip()
+                missing = (not val) or val == snap["missing_value"]
+                file_val = "" if missing else to_filename_value(
+                    val, str(cfg.get("type", "text")), int(cfg.get("max_len", 0) or 0))
+                fields[fname] = FieldResult(
+                    fname,
+                    snap["missing_value"] if missing else val,
+                    file_val or snap["missing_value"],
+                    ST_MISSING if missing else ST_OK,
+                    "从增量日志恢复")
+            results.append(ExtractResult(
+                path=str(path), original_name=path.name, mode=snap["mode"],
+                fields=fields,
+                doc_status=DOC_NOT_CONTRACT if skipped else DOC_OK,
+                note="从增量日志恢复（未重新扫描）"))
+        if not results:
+            return False
+        renamer = RenameEngine(snap["template"], snap["missing_value"], snap["max_len"],
+                               sequence_start=snap["sequence_counter"])
+        records = renamer.plan(results, directory)
+        self._fill_preview(results, records, [], snap, renamer.next_sequence)
+        return True
 
     # ------------------------------------------------------------------ 队列回灌
     def _drain(self):
