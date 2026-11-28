@@ -105,6 +105,8 @@ class ExtractResult:
     note: str = ""
     # V1.3.0：手写敏感字段的局部截图（字段名 -> 压缩 PNG 字节），嵌入 Excel 供人工核对
     field_images: dict[str, bytes] = field(default_factory=dict)
+    # V1.7.0：合同正文起始页（跳过前置审批表/说明页）；0 表示从第 1 页开始
+    contract_start_page: int = 0
 
     @property
     def skip_reason(self) -> str:

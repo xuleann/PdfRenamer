@@ -13,7 +13,8 @@ from .base import BasePdfExtractor, TextDoc, classify_text, clean_pdf_text, page
 class PyMuPdfExtractor(BasePdfExtractor):
     name = "pymupdf"
 
-    def extract(self, path: str | Path, first_pages: int = 3, last_pages: int = 0) -> TextDoc:
+    def extract(self, path: str | Path, first_pages: int = 3, last_pages: int = 0,
+                start_page: int = 0) -> TextDoc:
         try:
             import pymupdf  # PyMuPDF 1.24+ 的正式包名
         except ImportError:  # pragma: no cover - 兼容旧版别名
@@ -32,11 +33,11 @@ class PyMuPdfExtractor(BasePdfExtractor):
                 except Exception:
                     metadata = {}
                 try:
-                    head_text = doc.load_page(0).get_text("text") if count else ""
+                    head_text = doc.load_page(min(start_page, count - 1)).get_text("text") if count else ""
                 except Exception:
                     head_text = ""
                 parts = []
-                for i in page_indices(count, first_pages, last_pages):
+                for i in page_indices(count, first_pages, last_pages, start_page):
                     try:
                         parts.append(doc.load_page(i).get_text("text", sort=True))
                     except Exception:
@@ -47,4 +48,4 @@ class PyMuPdfExtractor(BasePdfExtractor):
 
         status, note = classify_text(text)
         return TextDoc(text, status, len(text.replace("\n", "").strip()), count, note,
-                       metadata=metadata, head_text=head_text)
+                       metadata=metadata, head_text=head_text, start_page=start_page)

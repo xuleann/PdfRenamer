@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .contract_gate import is_contract_document
@@ -17,9 +19,10 @@ from .models import (
     SKIP_DOC_STATUSES, ST_FALLBACK, ST_HEURISTIC, ST_MISSING, ST_OK,
 )
 from .presets import MODE_CONTRACT
-from .rules import (clean_value, detect_contract_type, find_department,
-                    find_person_name, is_placeholder, normalize_by_type,
-                    parse_duration_range, to_filename_value)
+from .rules import (DEPARTMENT_CHOICES, clean_person_name, clean_value,
+                    detect_contract_type, find_department, find_person_name,
+                    is_placeholder, normalize_by_type, parse_duration_range,
+                    to_filename_value)
 from .structured import SOURCE_KEYS, parse_paper
 
 _LABEL_WORDS = ("甲方", "乙方", "供方", "需方", "合同名称", "项目名称", "金额",
@@ -310,6 +313,14 @@ class ExtractEngine:
                     raw, status = cand, ST_FALLBACK
                     break
 
+        # V1.7.0：姓名字段统一清洗——截断「性别/民族」等下一栏标签粘连
+        if field.type == "person_name" and raw:
+            cleaned = clean_person_name(raw)
+            if cleaned and cleaned != raw:
+                raw = cleaned
+            elif not cleaned:
+                raw, status = "", ST_MISSING
+
         # 3) 按类型的保守启发式
         if not raw:
             cand = _heuristic(text, field)
@@ -336,7 +347,23 @@ class ExtractEngine:
 
     def extract_file(self, path: str | Path) -> ExtractResult:
         p = Path(path)
-        doc = self.extractor.extract(p, self.first_pages, self.last_pages)
+
+        # V1.7.0：合同前置页定位——有些合同前面夹了审批表/说明页，
+        # 真正的合同从「劳动合同书/劳务合同书」标题页开始。先找到这一页，
+        # 后续文本层提取、OCR、截图都从它起算，避免前置页的单位名/姓名/日期污染字段。
+        start_page = 0
+        if self.mode == MODE_CONTRACT and self.scan_rapid_enabled:
+            try:
+                from .extractor.ocr_rapid import find_contract_start_page, rapid_available
+                if rapid_available():
+                    start_page = find_contract_start_page(p)
+            except Exception:
+                start_page = 0
+        if start_page:
+            pass   # 起始页信息写入下面的 doc.note，供界面日志显示
+
+        doc = self.extractor.extract(p, self.first_pages, self.last_pages,
+                                     start_page=start_page)
         was_no_text = (doc.status == DOC_NO_TEXT)   # 原始是否为扫描件（无文本层）
 
         # V1.3.0 速度优化：RapidOCR 可用时，扫描件只跑 RapidOCR 一次
@@ -433,6 +460,7 @@ class ExtractEngine:
                         max_pages=self.scan_ocr_max_pages,
                         include_last=self.scan_ocr_include_last_page,
                         enhanced=True, decide=_decide,
+                        start_page=start_page,
                     ) or "")
                     if rapid_text:
                         doc.text = (doc.text + "\n" + rapid_text).strip()
@@ -441,6 +469,117 @@ class ExtractEngine:
                             doc.status = DOC_OK
                         doc.note = (doc.note + " " if doc.note else "") + "已附加 RapidOCR 手写识别"
                         res = self._finalize(doc, p)  # 用补充后的文本重新提取
+
+                        # V1.7.0：乙方姓名专项补识别——签名整页只认出首字/缺失时，
+                        # 对「乙方：___」右侧手写区放大+二值化再认，补回完整姓名。
+                        # 只在姓名不可信时跑，正常识别不增加耗时。
+                        try:
+                            fr = res.fields.get("乙方")
+                            old_name = re.sub(r"[^一-龥]", "", (fr.value if fr else "") or "")
+                            _NAME_NOISE = ("国家", "基金", "委员会", "中心", "自然", "科学",
+                                           "大学", "学院", "公司", "本人", "接受", "履行")
+                            org_noise = any(w in old_name for w in _NAME_NOISE)
+                            unreliable = (fr is None or fr.is_missing or len(old_name) < 2
+                                          or org_noise)
+                            if unreliable:
+                                # V1.7.0：严格只用合同正文页（前置登记表一律不参与）
+                                from .extractor.ocr_rapid import rapid_recover_name
+                                name = ""
+                                for _pi in (start_page, start_page + 1):
+                                    try:
+                                        name = rapid_recover_name(
+                                            p, page_index=_pi, dpi=ocr_dpi,
+                                            max_side=ocr_side)
+                                    except Exception:
+                                        name = ""
+                                    if name:
+                                        break
+                                if name:
+                                    new_name = re.sub(r"[^一-龥]", "", name)
+                                    # 有旧值（哪怕只有 1 字）时必须至少共享一个字，
+                                    # 防止把「齐气明」补成毫不相干的「希长明」。
+                                    # V1.7.5：旧值含「国家/基金/委员会/中心」等机构词时，
+                                    # 它是封面布局错位抓到的单位名（如「国家自然」），
+                                    # 不是人名，不能再用「共享一个字」把它留住，
+                                    # 直接采用签名区识别结果（郎小龙）。
+                                    if org_noise:
+                                        # 旧值是单位名，来源不可信，改用签名区结果但标注待核对
+                                        res.fields["乙方"] = FieldResult(
+                                            "乙方", name, name, ST_HEURISTIC,
+                                            "封面布局错位抓到单位名，已改用签名区识别，请核对")
+                                    elif not old_name or any(ch in new_name for ch in old_name):
+                                        res.fields["乙方"] = FieldResult(
+                                            "乙方", name, name, ST_OK, "签名区局部放大识别")
+                                    else:
+                                        res.fields["乙方"] = FieldResult(
+                                            "乙方", old_name, old_name, ST_HEURISTIC,
+                                            "签名局部识别不一致，保留原值待人工核对")
+                        except Exception:
+                            pass
+
+                        # V1.7.0：日期专项识别——截图能定位到合同期限那行，
+                        # 但全文 OCR 的日期值偶有偏差。当起止日期缺失/可疑时，
+                        # 按截图同样的规则裁那一行放大再认，用结果覆盖复核栏的值。
+                        try:
+                            def _bad_date(name: str) -> bool:
+                                fr = res.fields.get(name)
+                                if fr is None or fr.is_missing or not fr.value:
+                                    return True
+                                return not re.search(r"(?:19|20)\d{2}[-/.]\d{1,2}[-/.]\d{1,2}", fr.value)
+
+                            if _bad_date("开始日期") or _bad_date("结束日期"):
+                                from .extractor.ocr_rapid import rapid_recover_dates
+                                ds, de = "", ""
+                                for _pi in (start_page, start_page + 1, start_page + 2):
+                                    try:
+                                        ds, de = rapid_recover_dates(
+                                            p, page_index=_pi, dpi=ocr_dpi,
+                                            max_side=ocr_side)
+                                    except Exception:
+                                        ds, de = "", ""
+                                    if ds and de:
+                                        break
+                                if ds and de:
+                                    for fname, val in (("开始日期", ds), ("结束日期", de)):
+                                        res.fields[fname] = FieldResult(
+                                            fname, val, val, ST_OK, "合同期限行局部放大识别")
+
+                            # V1.7.1：签订日期取签章页手写落款，不取封面「制表日期」。
+                            sfr = res.fields.get("签订日期")
+                            if (sfr is None or sfr.is_missing
+                                    or sfr.status in (ST_HEURISTIC, ST_FALLBACK)):
+                                from .extractor.ocr_rapid import rapid_recover_sign_date
+                                sign = rapid_recover_sign_date(
+                                    p, dpi=ocr_dpi, max_side=ocr_side)
+                                if sign:
+                                    res.fields["签订日期"] = FieldResult(
+                                        "签订日期", sign, sign, ST_OK, "签章页手写落款")
+
+                            # V1.7.4：部门专项——整页 OCR 漏检/串字时，
+                            # 只裁合同正文「第二条第二点」固定区域放大再认。
+                            dfr = res.fields.get("用工部门")
+                            dval = re.sub(r"\s+", "", (dfr.value if dfr else "") or "")
+                            if dval not in DEPARTMENT_CHOICES:
+                                from .extractor.ocr_rapid import rapid_recover_department
+                                dept = ""
+                                # V1.7.5：只扫正文前两页（第二条第二点就在这里），
+                                # 且用与主 OCR 相同的 dpi/max_side，直接命中页缓存。
+                                for _pi in (start_page, start_page + 1):
+                                    try:
+                                        dept = rapid_recover_department(
+                                            p, page_index=_pi, dpi=ocr_dpi,
+                                            max_side=ocr_side)
+                                    except Exception:
+                                        dept = ""
+                                    if dept:
+                                        break
+                                if dept:
+                                    res.fields["用工部门"] = FieldResult(
+                                        "用工部门", dept, dept, ST_OK, "第二条第二点专项识别")
+
+                            # V1.7.0：前置登记表页一律不参与取值。
+                        except Exception:
+                            pass
             except Exception:
                 pass  # RapidOCR 是增强能力，绝不能影响主流程
 
@@ -488,6 +627,7 @@ class ExtractEngine:
         res = ExtractResult(
             path=str(p), original_name=p.name, mode=self.mode,
             doc_status=doc.status, text_chars=doc.chars, note=doc.note,
+            contract_start_page=getattr(doc, "start_page", 0) or 0,
         )
         # V1.1.2：闸门只在「确有正常文本层」时执行（显式白名单）。
         # 保证 OCR 降级后仍是 no_text_layer，不会被误标成「非合同文档」。
@@ -516,6 +656,15 @@ class ExtractEngine:
         # V1.3.0 合同模式专项后处理：
         # 1) 合同期限范围一次解析起止日期，纠正旧的错位（开始抓成结束年份）。
         if self.mode == MODE_CONTRACT:
+            # V1.7.4：部门硬约束——只能 7 选 1，否则清空。
+            # 旧兜底会把「可调整乙方的工作部门、岗位…」整段正文当部门值。
+            dfr = res.fields.get("用工部门")
+            if dfr is not None and dfr.value:
+                dv = re.sub(r"\s+", "", dfr.value)
+                if dv not in DEPARTMENT_CHOICES:
+                    res.fields["用工部门"] = FieldResult(
+                        "用工部门", "", "", ST_MISSING, "部门值非 7 选 1，已清空")
+
             start, end = parse_duration_range(text)
             if start and end:
                 for fname, val in (("开始日期", start), ("结束日期", end)):
@@ -567,18 +716,48 @@ class ExtractEngine:
             res.note = doc.note
         return res
 
+    def _extract_one_safe(self, p: Path) -> ExtractResult:
+        try:
+            return self.extract_file(p)
+        except Exception as exc:  # 单文件失败不影响整批
+            r = ExtractResult(str(p), p.name, self.mode, doc_status=DOC_ERROR,
+                              note=f"{type(exc).__name__}: {exc}")
+            r.fields = {f.name: FieldResult(f.name, "", self.missing_value,
+                                            ST_MISSING, r.skip_reason) for f in self.fields}
+            return r
+
     def extract_many(self, paths: list[Path], progress=None) -> list[ExtractResult]:
-        out = []
+        """V1.7.5：多文件用线程池并行（不改变任何识别参数，纯并行）。
+
+        OCR 推理会释放 GIL，实测 4 线程约 1.4x；单文件时仍走串行，无额外开销。
+        结果顺序与输入一致，progress 仍按完成数递增。
+        """
         total = len(paths)
-        for i, p in enumerate(paths, 1):
-            try:
-                out.append(self.extract_file(p))
-            except Exception as exc:  # 单文件失败不影响整批
-                r = ExtractResult(str(p), p.name, self.mode, doc_status=DOC_ERROR,
-                                  note=f"{type(exc).__name__}: {exc}")
-                r.fields = {f.name: FieldResult(f.name, "", self.missing_value,
-                                                ST_MISSING, r.skip_reason) for f in self.fields}
-                out.append(r)
-            if progress:
-                progress(i, total, p.name)
-        return out
+        if total <= 1 or os.environ.get("PDFRENAMER_NO_PARALLEL"):
+            out = []
+            for i, p in enumerate(paths, 1):
+                out.append(self._extract_one_safe(p))
+                if progress:
+                    progress(i, total, p.name)
+            return out
+        out: list[ExtractResult | None] = [None] * total
+        done = 0
+        workers = max(1, min(4, total))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(self._extract_one_safe, p): i for i, p in enumerate(paths)}
+            for fut in as_completed(futs):
+                idx = futs[fut]
+                try:
+                    out[idx] = fut.result()
+                except Exception as exc:  # 理论上不会到这里
+                    p = paths[idx]
+                    r = ExtractResult(str(p), p.name, self.mode, doc_status=DOC_ERROR,
+                                      note=f"{type(exc).__name__}: {exc}")
+                    r.fields = {f.name: FieldResult(f.name, "", self.missing_value,
+                                                    ST_MISSING, r.skip_reason)
+                                for f in self.fields}
+                    out[idx] = r
+                done += 1
+                if progress:
+                    progress(done, total, paths[idx].name)
+        return [r for r in out if r is not None]

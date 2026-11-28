@@ -667,14 +667,24 @@ class MainWindow:
             targets = [n for n in names if n in FIELD_ANCHORS]
             if not targets:
                 return {}
-            # V1.6.1：乙方固定第 1 页、签订日期固定末页（-1）签章区；
-            # 开始/结束日期按日期数字定位（不限页）。
+            # V1.7.0：乙方固定「合同正文首页」（跳过前置审批表页）；
+            # 签订日期固定末页（-1）签章区；开始/结束日期按日期数字定位（不限页）。
+            sp = getattr(r, "contract_start_page", 0) or 0
             page_map: dict[str, list[int]] = {}
             if "乙方" in targets:
-                page_map["乙方"] = [0]
+                page_map["乙方"] = [sp]
             if "签订日期" in targets:
                 page_map["签订日期"] = [-1]
-            return crop_field_images(r.path, targets, field_pages=page_map or None)
+            if "开始日期" in targets:
+                page_map["开始日期"] = [sp, sp + 1]
+            if "结束日期" in targets:
+                page_map["结束日期"] = [sp, sp + 1]
+            # V1.7.0：部门固定从合同正文前两页找（第二条第二点），
+            # 绝不再截到前置考核登记表的「部门：机关服务二部」。
+            if "用工部门" in targets:
+                page_map["用工部门"] = [sp, sp + 1]
+            return crop_field_images(r.path, targets, field_pages=page_map or None,
+                                     start_page=sp)
         except Exception:
             return {}
 

@@ -264,9 +264,31 @@ class ExcelWriter:
         except Exception:
             pass
 
+    def _rebuild_images(self) -> None:
+        """逐行 save 会让 openpyxl 复用已关闭的 PIL 图片句柄。
+
+        保存前丢掉 worksheet 里的 Image 对象，用原始文件路径重新创建——
+        文件内容仍在磁盘（finish 时才清理），因此不会丢失图片。
+        """
+        pending = getattr(self, "_pending_images", None)
+        if not pending or self.ws is None:
+            return
+        try:
+            self.ws._images = []
+            from openpyxl.drawing.image import Image as XLImage
+            for path, anchor in pending:
+                if not Path(path).exists():
+                    continue
+                img = XLImage(path)
+                img.anchor = anchor
+                self.ws.add_image(img)
+        except Exception:
+            pass
+
     def _save(self) -> None:
         if self.wb is None:
             return
+        self._rebuild_images()
         try:
             self.wb.save(self.path)
         except PermissionError as exc:
@@ -392,9 +414,16 @@ class ExcelWriter:
                 img_path = Path(self._image_dir) / f"snip_{row_idx}_{self._image_seq}.jpg"
                 pil.save(str(img_path), format="JPEG",
                          quality=90 if hq else 72, optimize=True)
+                # V1.7.3：保留每行的图片路径与锚点。逐行 save 时 openpyxl 会
+                # 反复读取同一图片文件，PIL 句柄可能被关闭导致
+                # 「I/O operation on closed file」。每次 save 前用路径重建
+                # XLImage（见 _rebuild_images），不用缓存的 Image 对象。
+                if not hasattr(self, "_pending_images"):
+                    self._pending_images = []
+                self._pending_images.append((str(img_path),
+                                             f"{get_column_letter(col_of[target_col])}{row_idx}"))
                 img = XLImage(str(img_path))
-                anchor = f"{get_column_letter(col_of[target_col])}{row_idx}"
-                img.anchor = anchor
+                img.anchor = self._pending_images[-1][1]
                 self.ws.add_image(img)
                 # 列宽/行高调到能容纳图片：列宽字符数≈像素/7，行高磅≈像素*0.75
                 letter = get_column_letter(col_of[target_col])

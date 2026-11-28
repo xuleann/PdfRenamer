@@ -24,12 +24,14 @@ FIELD_ANCHORS: dict[str, tuple[str, ...]] = {
     # 嵌在句子中，没有「用工部门：」标签；只靠标签词定位会失败、没截图。
     # OCR 认出任一部门名即可定位到那一行截图供人工核对。
     "用工部门": (
-        # V1.4.4：把「只在第二条第二点出现」的特异写法放最前，并删掉过于宽泛的
-        # 单字「岗」——旧锚点会先命中标题「第二条 工作岗位」，把标题截进单元格。
+        # V1.7.3：只用「第二条第二点」的特异锚点。
+        # 旧的泛用词「部门/用工部门/办公室…」会命中标题「第二条 工作岗位」、
+        # 正文「用人部（室）各执一份」或前置登记表「部门：」，截错位置。
         "部（室）", "部(室)", "部（室", "部(室",
         "（部门）", "(部门)", "部门）", "部门)",
-        "用工部门", "工作部门", "所属部门", "部门",
-        "办公室", "财务室", "服务一部", "服务二部", "交通", "物业", "资产",
+        # 精确标签兜底（仅带冒号的完整标签，不用裸「部门」——
+        # 裸词会命中标题「第二条 工作岗位」和尾部「用人部（室）各执一份」）
+        "用工部门：", "工作部门：", "所属部门：",
     ),
     "签订日期": ("签订日期", "签署日期", "签约日期", "签订时间", "签署时间"),
     "身份证号": ("身份证号码", "身份证号", "公民身份号码", "身份证"),
@@ -395,7 +397,8 @@ def _crop_fields_on_words(img, words, fields: list[str]) -> dict[str, bytes]:
 
 
 def _crop_from_ocr_words(path, fields: list[str], *, dpi: int, max_side: int,
-                         field_pages: dict[str, list[int]] | None = None) -> dict[str, bytes]:
+                         field_pages: dict[str, list[int]] | None = None,
+                         start_page: int = 0) -> dict[str, bytes]:
     """扫描件兜底：用 RapidOCR 词框定位标签，裁剪其右侧/下方手写区域。
 
     扫描件没有文本层，page.search_for 永远找不到，必须用 OCR 的词坐标。
@@ -414,8 +417,9 @@ def _crop_from_ocr_words(path, fields: list[str], *, dpi: int, max_side: int,
         with pymupdf.open(str(Path(path))) as doc:
             total = doc.page_count
         # 手写字段集中在正文前几页与末页签章页
-        # V1.6.3：合同期限标题可能在第 4 页（如 xx11 样本在 p3），扩到前 4 页
-        pages = list(range(min(4, total)))
+        # V1.7.0：一律从合同正文首页起算，前面的审批表/登记表页不截图
+        sp = max(0, min(int(start_page or 0), max(0, total - 1)))
+        pages = list(range(sp, min(sp + 4, total)))
         if total > 1 and (total - 1) not in pages:
             pages.append(total - 1)
 
@@ -430,11 +434,17 @@ def _crop_from_ocr_words(path, fields: list[str], *, dpi: int, max_side: int,
                 pi = total - 1 if raw_pi == -1 else raw_pi   # V1.6.1：-1=末页
                 if not (0 <= pi < total):
                     continue
-                img, words = rapid_locate_words(path, dpi=ocr_dpi, max_side=ocr_side,
-                                                page_index=pi)
-                if img is None or not words:
-                    continue
-                found = _crop_fields_on_words(img, words, [fi])
+                # V1.7.3：多 dpi 重试——同一页在 300dpi 认不出、150dpi 能认出
+                # （实测张冉合同身份证号）。逐个 dpi 试，找到就停。
+                found = {}
+                for _dpi in (ocr_dpi, 200, 150):
+                    img, words = rapid_locate_words(path, dpi=_dpi, max_side=ocr_side,
+                                                    page_index=pi)
+                    if img is None or not words:
+                        continue
+                    found = _crop_fields_on_words(img, words, [fi])
+                    if fi in found:
+                        break
                 if fi in found:
                     result[fi] = found[fi]
                     break
@@ -446,16 +456,48 @@ def _crop_from_ocr_words(path, fields: list[str], *, dpi: int, max_side: int,
             # 部门只在正文前几页找：末页签章区已有「用人部（室）各执壹份」这类干扰
             if pi not in (0, 1, 2) and all(f == "用工部门" for f in remaining):
                 continue
-            img, words = rapid_locate_words(path, dpi=ocr_dpi, max_side=ocr_side,
-                                            page_index=pi)
-            if img is None or not words:
-                continue
-            found = _crop_fields_on_words(img, words, remaining)
+            found = {}
+            for _dpi in (ocr_dpi, 200, 150):
+                img, words = rapid_locate_words(path, dpi=_dpi, max_side=ocr_side,
+                                                page_index=pi)
+                if img is None or not words:
+                    continue
+                found = _crop_fields_on_words(img, words, remaining)
+                if found:
+                    break
             if found:
                 result.update(found)
                 remaining = [f for f in remaining if f not in result]
     except Exception:
         pass
+    # V1.7.3：身份证号兜底——该行在部分扫描件里被 OCR 检测整行漏掉
+    # （性别与现通讯地址之间直接跳过），用词框位置夹出这一行。
+    if "身份证号" not in result and "身份证号" in fields:
+        try:
+            with pymupdf.open(str(Path(path))) as doc:
+                total = doc.page_count
+            for pi in range(start_page, min(start_page + 3, total)):
+                img, words = rapid_locate_words(path, dpi=300, max_side=2600,
+                                                page_index=pi)
+                if img is None or not words:
+                    continue
+                sex = [b for t, b in words if "性别" in str(t)]
+                addr = [b for t, b in words if "现通讯地址" in str(t)
+                        or "通讯地址" in str(t)]
+                if not sex or not addr:
+                    continue
+                y0 = min(float(b[3]) for b in sex)
+                y1 = min(float(b[1]) for b in addr)
+                if y1 <= y0 or y1 - y0 > (img.height * 0.25):
+                    continue
+                x0 = min(float(b[0]) for b in sex)
+                crop = img.crop((max(0, int(x0 - 8)), int(y0),
+                                 min(img.width, int(img.width * 0.78)), int(y1)))
+                if crop.width > 20 and crop.height > 8:
+                    result["身份证号"] = _compress_pil(crop, "身份证号")
+                    break
+        except Exception:
+            pass
     return result
 
 
@@ -498,7 +540,8 @@ def _crop_first_page_bands(path, fields: list[str], *, dpi: int, max_side: int) 
 
 def crop_field_images(path: str | Path, fields: list[str], *,
                       dpi: int = 200, max_side: int = 2000,
-                      field_pages: dict[str, list[int]] | None = None) -> dict[str, bytes]:
+                      field_pages: dict[str, list[int]] | None = None,
+                      start_page: int = 0) -> dict[str, bytes]:
     """对给定字段列表，从 PDF 裁剪局部截图，返回 {字段名: 图片字节}。
 
     两条路径按优先级：
@@ -523,7 +566,8 @@ def crop_field_images(path: str | Path, fields: list[str], *,
             if doc.page_count == 0:
                 return result
             total = doc.page_count
-            pages = list(range(min(2, total)))
+            sp = max(0, min(int(start_page or 0), max(0, total - 1)))
+            pages = list(range(sp, min(sp + 2, total)))
             if total - 1 not in pages:
                 pages.append(total - 1)
             located: dict[str, tuple[int, object]] = {}
@@ -588,7 +632,7 @@ def crop_field_images(path: str | Path, fields: list[str], *,
     # 路径2：扫描件 OCR 词框
     if remaining:
         ocr_result = _crop_from_ocr_words(path, remaining, dpi=dpi, max_side=max_side,
-                                          field_pages=field_pages)
+                                          field_pages=field_pages, start_page=start_page)
         result.update(ocr_result)
     # V1.3.9：不再用「首页条带兜底」——它会截到「劳动合同书」大标题，
     # 用户看到的是错的字段图，比没有截图更误导。定位不到就留空。

@@ -10,7 +10,8 @@ from .base import BasePdfExtractor, TextDoc, classify_text, clean_pdf_text, page
 class PdfPlumberExtractor(BasePdfExtractor):
     name = "pdfplumber"
 
-    def extract(self, path: str | Path, first_pages: int = 3, last_pages: int = 0) -> TextDoc:
+    def extract(self, path: str | Path, first_pages: int = 3, last_pages: int = 0,
+                start_page: int = 0) -> TextDoc:
         try:
             import pdfplumber
         except ImportError as exc:
@@ -27,7 +28,7 @@ class PdfPlumberExtractor(BasePdfExtractor):
                 except Exception:
                     head_text = ""
                 parts = []
-                for i in page_indices(count, first_pages, last_pages):
+                for i in page_indices(count, first_pages, last_pages, start_page):
                     try:
                         parts.append(pdf.pages[i].extract_text() or "")
                     except Exception:
@@ -37,4 +38,4 @@ class PdfPlumberExtractor(BasePdfExtractor):
             return self._failure(exc)
         status, note = classify_text(text)
         return TextDoc(text, status, len(text.replace("\n", "").strip()), count, note,
-                       metadata=metadata, head_text=head_text)
+                       metadata=metadata, head_text=head_text, start_page=start_page)

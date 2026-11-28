@@ -27,6 +27,8 @@ class TextDoc:
     # 论文结构化解析所需的原始信息（纯本地读取，不含任何推理）
     metadata: dict = field(default_factory=dict)
     head_text: str = ""   # 首页未重排的原文，保留标题/作者的行边界
+    # V1.7.0：合同正文起始页（跳过前置审批表/说明页）
+    start_page: int = 0
 
 
 def clean_pdf_text(raw: str) -> str:
@@ -55,11 +57,16 @@ def classify_text(text: str, min_chars: int = 20) -> tuple[str, str]:
     return DOC_OK, ""
 
 
-def page_indices(page_count: int, first_pages: int = 3, last_pages: int = 0) -> list[int]:
-    """按「前 N 页 + 后 M 页」选取，去重并保持原顺序。"""
+def page_indices(page_count: int, first_pages: int = 3, last_pages: int = 0,
+                 start_page: int = 0) -> list[int]:
+    """按「起始页起的前 N 页 + 后 M 页」选取，去重并保持原顺序。
+
+    V1.7.0：start_page 为合同正文首页，前置审批表/说明页不参与提取。
+    """
     if page_count <= 0:
         return []
-    head = list(range(min(page_count, max(0, first_pages))))
+    sp = max(0, min(int(start_page or 0), max(0, page_count - 1)))
+    head = list(range(sp, min(page_count, sp + max(0, first_pages))))
     tail = list(range(max(0, page_count - last_pages), page_count)) if last_pages > 0 else []
     seen: set[int] = set()
     out: list[int] = []
@@ -73,7 +80,8 @@ def page_indices(page_count: int, first_pages: int = 3, last_pages: int = 0) -> 
 class BasePdfExtractor:
     name = "base"
 
-    def extract(self, path: str | Path, first_pages: int = 3, last_pages: int = 0) -> TextDoc:
+    def extract(self, path: str | Path, first_pages: int = 3, last_pages: int = 0,
+                start_page: int = 0) -> TextDoc:
         raise NotImplementedError
 
     def _failure(self, exc: Exception, pages: int = 0) -> TextDoc:
